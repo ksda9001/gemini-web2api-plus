@@ -93,8 +93,8 @@ def _build_headers() -> dict:
     return headers
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
-    inner = [None] * 80
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -116,6 +116,9 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            inner[k] = v
     outer = [None, json.dumps(inner)]
     return urllib.parse.urlencode({"f.req": json.dumps(outer)})
 
@@ -171,9 +174,9 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs).encode()
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
@@ -201,15 +204,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs)
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()

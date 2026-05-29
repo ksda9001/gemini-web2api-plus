@@ -138,7 +138,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err = resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -157,7 +157,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images)):
+                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -172,7 +172,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images))
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -208,7 +208,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err = resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -263,7 +263,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images))
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -317,7 +317,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -337,7 +337,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
                     if not delta:
                         continue
                     full_text += delta
@@ -363,7 +363,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
