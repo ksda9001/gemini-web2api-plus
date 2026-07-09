@@ -26,6 +26,7 @@ from .agent import (
     ResponseStore,
     build_tool_retry_prompt,
     compact_messages,
+    fallback_tool_call,
     response_call_to_tool_call,
     response_content_to_message_parts,
     response_messages_from_output,
@@ -247,6 +248,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = fallback_tool_call(chat_messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -481,6 +486,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = fallback_tool_call(messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -676,6 +685,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = fallback_tool_call(anthropic_messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
         usage = _usage(prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         if tool_calls:

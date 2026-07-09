@@ -380,6 +380,70 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 harness.close()
 
+    def test_responses_falls_back_to_safe_shell_inspection_when_retry_stays_text(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                "I will inspect the workspace first.",
+                "I still cannot call tools from here.",
+            ])
+            try:
+                response = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "create a deployable Mars app",
+                    "tools": TOOLS,
+                })
+                call = response["output"][0]
+                self.assertEqual(call["type"], "function_call")
+                self.assertEqual(call["name"], "shell_command")
+                self.assertEqual(json.loads(call["arguments"])["command"], "pwd; ls")
+                self.assertEqual(len(harness.prompts), 2)
+            finally:
+                harness.close()
+
+    def test_anthropic_falls_back_to_safe_shell_inspection_when_retry_stays_text(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                "I will inspect the workspace first.",
+                "I still cannot call tools from here.",
+            ])
+            try:
+                response = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                })
+                block = response["content"][0]
+                self.assertEqual(block["type"], "tool_use")
+                self.assertEqual(block["name"], "shell_command")
+                self.assertEqual(block["input"]["command"], "pwd; ls")
+                self.assertEqual(response["stop_reason"], "tool_use")
+            finally:
+                harness.close()
+
+    def test_chat_completions_falls_back_to_safe_shell_inspection_when_retry_stays_text(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                "I will inspect the workspace first.",
+                "I still cannot call tools from here.",
+            ])
+            try:
+                response = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": TOOLS,
+                })
+                message = response["choices"][0]["message"]
+                tool_call = message["tool_calls"][0]
+                self.assertEqual(tool_call["function"]["name"], "shell_command")
+                self.assertEqual(json.loads(tool_call["function"]["arguments"])["command"], "pwd; ls")
+                self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+            finally:
+                harness.close()
+
     def test_chat_completions_retries_to_tool_call_for_copilot(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [

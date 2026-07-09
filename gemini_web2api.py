@@ -685,6 +685,40 @@ def _should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_
     return bool(text and ACTION_RE.search(text))
 
 
+def _fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
+    if not _should_retry_tool_call(messages, tools, tool_choice, "", None):
+        return None
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name") or tool.get("name", "") if isinstance(tool, dict) else ""
+        if not isinstance(name, str) or not name.strip():
+            continue
+        lowered = name.lower()
+        if not any(marker in lowered for marker in ("shell", "command", "terminal", "bash", "powershell")):
+            continue
+        parameters = fn.get("parameters") or tool.get("parameters", {}) if isinstance(tool, dict) else {}
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        arg_name = "command"
+        if arg_name not in properties:
+            if "cmd" in properties:
+                arg_name = "cmd"
+            else:
+                candidates = [p for p in required if isinstance(p, str)]
+                candidates += [p for p, spec in properties.items() if isinstance(spec, dict) and spec.get("type") == "string"]
+                if candidates:
+                    arg_name = candidates[0]
+        return [{
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": name.strip(),
+                "arguments": json.dumps({arg_name: "pwd; ls"}, ensure_ascii=False),
+            },
+        }]
+    return None
+
+
 def _build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
     target = ""
     if isinstance(tool_choice, dict):
@@ -1008,6 +1042,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_text, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = _fallback_tool_call(chat_messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
 
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -1283,6 +1321,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_text, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = _fallback_tool_call(messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -1474,6 +1516,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_text, retry_calls
                     break
+        if not tool_calls:
+            tool_calls = _fallback_tool_call(anthropic_messages, tools, tool_choice)
+            if tool_calls:
+                text = ""
 
         usage = _usage(prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"

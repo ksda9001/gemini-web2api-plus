@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 
@@ -156,6 +157,49 @@ def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_c
     if not user_text or not ACTION_RE.search(user_text):
         return bool(text and ACTION_RE.search(text))
     return True
+
+
+def fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
+    """Return a safe read-only shell call when Gemini refuses an obvious agent action.
+
+    This is intentionally conservative: it only starts the tool loop with a
+    workspace inspection command, leaving actual edits to the next model turn.
+    """
+    if not should_retry_tool_call(messages, tools, tool_choice, "", None):
+        return None
+
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name") or tool.get("name", "") if isinstance(tool, dict) else ""
+        if not isinstance(name, str) or not name.strip():
+            continue
+        lowered = name.lower()
+        if not any(marker in lowered for marker in ("shell", "command", "terminal", "bash", "powershell")):
+            continue
+
+        parameters = fn.get("parameters") or tool.get("parameters", {}) if isinstance(tool, dict) else {}
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        arg_name = "command"
+        if arg_name not in properties:
+            if "cmd" in properties:
+                arg_name = "cmd"
+            else:
+                candidates = [p for p in required if isinstance(p, str)]
+                candidates += [p for p, spec in properties.items() if isinstance(spec, dict) and spec.get("type") == "string"]
+                if candidates:
+                    arg_name = candidates[0]
+
+        return [{
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": name.strip(),
+                "arguments": json.dumps({arg_name: "pwd; ls"}, ensure_ascii=False),
+            },
+        }]
+
+    return None
 
 
 def build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
