@@ -14,7 +14,7 @@
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "response_store_path": "responses.db",
+  "response_store_path": "/app/data/responses.db",
   "response_store_ttl_sec": 86400,
   "response_store_max_rows": 1000,
   "max_tool_output_chars": 12000,

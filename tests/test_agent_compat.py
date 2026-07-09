@@ -361,6 +361,25 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 harness.close()
 
+    def test_responses_retries_for_deployable_mars_prompt(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                "I will create an interactive draggable Mars app for Cloudflare Pages.",
+                '{"name":"shell_command","arguments":{"command":"New-Item -ItemType Directory -Force outputs"}}',
+            ])
+            try:
+                response = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "做一个可以部署在cf上的，可以拖动的运动的火星",
+                    "tools": TOOLS,
+                })
+                self.assertEqual(response["output"][0]["type"], "function_call")
+                self.assertEqual(response["output"][0]["name"], "shell_command")
+                self.assertEqual(len(harness.prompts), 2)
+                self.assertIn("previous answer", harness.prompts[1])
+            finally:
+                harness.close()
+
     def test_chat_completions_retries_to_tool_call_for_copilot(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [
