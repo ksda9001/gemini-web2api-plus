@@ -106,6 +106,12 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-key
 export ANTHROPIC_MODEL=gemini-3.5-flash
 ```
 
+Agent 兼容能力包括:
+- 当模型只描述动作而没有调用工具时, 自动进行一次工具调用修复重试
+- 使用 SQLite 保存 Responses 历史, 支持 `previous_response_id` 和 `GET /v1/responses/{id}`
+- 对超长工具输出和旧历史做确定性截断/压缩
+- 在 prompt 上下文中保留 Anthropic `thinking` / `redacted_thinking` 信息
+
 ## 可用模型
 
 | 模型 | 说明 | 输出量 |
@@ -195,11 +201,25 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "response_store_path": "responses.db",
+  "response_store_ttl_sec": 86400,
+  "response_store_max_rows": 1000,
+  "max_tool_output_chars": 12000,
+  "max_history_messages": 40,
+  "max_history_chars": 60000,
+  "tool_retry_attempts": 1
 }
 ```
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+Agent 相关配置:
+- `response_store_path`: Responses API 状态的 SQLite 文件；Docker 部署时建议挂载为 volume, 让历史在容器重建后仍保留
+- `response_store_ttl_sec`: 历史保留时间
+- `max_tool_output_chars`: shell/tool 输出进入上下文前的首尾截断长度
+- `max_history_messages` / `max_history_chars`: 历史上下文压缩上限
+- `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 
 ## Docker 部署
 

@@ -33,6 +33,7 @@ import hashlib
 import argparse
 import base64
 import threading
+import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -60,6 +61,13 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    "response_store_path": "responses.db",
+    "response_store_ttl_sec": 86400,
+    "response_store_max_rows": 1000,
+    "max_tool_output_chars": 12000,
+    "max_history_messages": 40,
+    "max_history_chars": 60000,
+    "tool_retry_attempts": 1,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -67,6 +75,7 @@ CONFIG = dict(DEFAULT_CONFIG)
 RESPONSE_HISTORY = {}
 RESPONSE_HISTORY_LOCK = threading.Lock()
 RESPONSE_HISTORY_MAX = 100
+RESPONSE_STORE = None
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -528,6 +537,239 @@ def parse_tool_calls(text: str) -> tuple:
     return clean, tool_calls
 
 
+ACTION_RE = re.compile(
+    r"(\b(create|generate|write|save|edit|modify|delete|remove|read|cat|list|ls|inspect|check|"
+    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search)\b"
+    r"|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查)",
+    re.IGNORECASE,
+)
+
+
+def _json_clone(value):
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _text_from_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "tool_result":
+                    parts.append(_text_from_content(item.get("content", "")))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _truncate_text(text, max_chars: int = 12000) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head_len = max_chars // 2
+    tail_len = max_chars - head_len
+    omitted = len(text) - head_len - tail_len
+    return text[:head_len] + f"\n\n[... truncated {omitted} characters ...]\n\n" + text[-tail_len:]
+
+
+def _compact_messages(messages: list, max_messages: int = 40, max_chars: int = 60000, max_tool_chars: int = 12000) -> list:
+    compacted = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        msg = dict(msg)
+        if msg.get("role") == "tool":
+            msg["content"] = _truncate_text(msg.get("content", ""), max_tool_chars)
+        compacted.append(msg)
+    system = [m for m in compacted if m.get("role") == "system"][:1]
+    non_system = [m for m in compacted if m.get("role") != "system"]
+    first_user = []
+    for msg in non_system:
+        if msg.get("role") == "user":
+            first_user = [msg]
+            break
+    protected_ids = {id(m) for m in system + first_user}
+    recent = []
+    for msg in reversed(non_system):
+        if id(msg) not in protected_ids:
+            recent.append(msg)
+        if len(recent) >= max_messages:
+            break
+    result = system + first_user + list(reversed(recent))
+    if len(json.dumps(result, ensure_ascii=False)) > max_chars:
+        result = system + first_user + [{"role": "system", "content": "[Earlier conversation compacted.]"}] + list(reversed(recent[:max(1, max_messages // 2)]))
+    return _json_clone(result)
+
+
+def _latest_user_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _text_from_content(msg.get("content", ""))
+            if text.strip():
+                return text
+    return ""
+
+
+def _any_user_action_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _text_from_content(msg.get("content", ""))
+            if text.strip() and ACTION_RE.search(text):
+                return text
+    return ""
+
+
+def _should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_calls) -> bool:
+    if not tools or tool_choice == "none" or tool_calls:
+        return False
+    if tool_choice == "required" or isinstance(tool_choice, dict):
+        return True
+    user_text = _any_user_action_text(messages) or _latest_user_text(messages)
+    return bool(user_text and ACTION_RE.search(user_text))
+
+
+def _build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
+    target = ""
+    if isinstance(tool_choice, dict):
+        fn_name = tool_choice.get("function", {}).get("name", "")
+        if fn_name:
+            target = f' Call only "{fn_name}".'
+    return (
+        f"{prompt}\n\n"
+        "[System instruction]: Your previous answer described the action instead of calling a tool. "
+        "Return ONLY one valid tool_call block or raw JSON tool call object now."
+        f"{target}"
+    )
+
+
+def _response_store_path() -> str:
+    return CONFIG.get("response_store_path") or "responses.db"
+
+
+def _response_store_init():
+    path = _response_store_path()
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    con = sqlite3.connect(path, timeout=30)
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS responses ("
+        "id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
+        "previous_response_id TEXT, model TEXT, response_json TEXT NOT NULL, messages_json TEXT NOT NULL)"
+    )
+    return con
+
+
+def _response_store_save(response: dict, messages: list, previous_response_id: str = None):
+    now = int(time.time())
+    response = dict(response)
+    response.setdefault("created_at", now)
+    if previous_response_id:
+        response["previous_response_id"] = previous_response_id
+    history = _compact_messages(
+        messages + _responses_output_to_messages_static(response.get("output", [])),
+        CONFIG.get("max_history_messages", 40),
+        CONFIG.get("max_history_chars", 60000),
+        CONFIG.get("max_tool_output_chars", 12000),
+    )
+    with RESPONSE_HISTORY_LOCK:
+        with _response_store_init() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO responses "
+                "(id, created_at, updated_at, previous_response_id, model, response_json, messages_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    response["id"],
+                    int(response.get("created_at") or now),
+                    now,
+                    previous_response_id,
+                    response.get("model", ""),
+                    json.dumps(response, ensure_ascii=False),
+                    json.dumps(history, ensure_ascii=False),
+                ),
+            )
+            ttl = int(CONFIG.get("response_store_ttl_sec", 86400) or 0)
+            if ttl > 0:
+                con.execute("DELETE FROM responses WHERE updated_at < ?", (now - ttl,))
+
+
+def _response_store_get_response(response_id: str):
+    with RESPONSE_HISTORY_LOCK:
+        with _response_store_init() as con:
+            row = con.execute("SELECT response_json FROM responses WHERE id = ?", (response_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _response_store_get_messages(response_id: str) -> list:
+    if not response_id:
+        return []
+    with RESPONSE_HISTORY_LOCK:
+        with _response_store_init() as con:
+            row = con.execute("SELECT messages_json FROM responses WHERE id = ?", (response_id,)).fetchone()
+    return json.loads(row[0]) if row else []
+
+
+def _response_call_to_tool_call_static(item: dict, fallback_index: int = 0) -> dict:
+    function = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+    name = item.get("name") or function.get("name", "")
+    arguments = item.get("arguments", function.get("arguments", "{}"))
+    if arguments is None:
+        arguments = "{}"
+    elif not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    call_id = item.get("call_id") or item.get("id") or f"call_{fallback_index}"
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def _response_content_to_message_parts_static(content) -> tuple:
+    text_parts = []
+    tool_calls = []
+    if isinstance(content, list):
+        for index, part in enumerate(content):
+            if not isinstance(part, dict):
+                if part is not None:
+                    text_parts.append(str(part))
+                continue
+            part_type = part.get("type")
+            if part_type in ("input_text", "output_text", "text"):
+                text_parts.append(part.get("text", ""))
+            elif part_type == "function_call":
+                tool_calls.append(_response_call_to_tool_call_static(part, index))
+    elif isinstance(content, str):
+        text_parts.append(content)
+    elif content is not None:
+        text_parts.append(str(content))
+    return "\n".join(p for p in text_parts if p), tool_calls
+
+
+def _responses_output_to_messages_static(output: list) -> list:
+    messages = []
+    for index, item in enumerate(output or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            messages.append({"role": "assistant", "content": None, "tool_calls": [_response_call_to_tool_call_static(item, index)]})
+        elif item.get("type") == "message":
+            text, tool_calls = _response_content_to_message_parts_static(item.get("content", []))
+            message = {"role": item.get("role", "assistant"), "content": text or None}
+            if tool_calls:
+                message["role"] = "assistant"
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+    return messages
+
+
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -567,7 +809,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if self.path.startswith("/v1/responses/"):
+                response_id = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
+                response = _response_store_get_response(response_id)
+                if response is None:
+                    self.send_json({"error": {"message": "response not found"}}, 404)
+                else:
+                    self.send_json(response)
+            elif self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
@@ -641,7 +890,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        prompt = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        chat_messages = _compact_messages(
+            req.get("messages", []),
+            CONFIG.get("max_history_messages", 40),
+            CONFIG.get("max_history_chars", 60000),
+            CONFIG.get("max_tool_output_chars", 12000),
+        )
+        prompt = messages_to_prompt(chat_messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -680,6 +935,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        if _should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                if retry_calls:
+                    text, tool_calls = retry_text, retry_calls
+                    break
 
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -854,6 +1115,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 output = item.get("output", "")
                 if not isinstance(output, str):
                     output = json.dumps(output, ensure_ascii=False)
+                output = _truncate_text(output, CONFIG.get("max_tool_output_chars", 12000))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": item.get("call_id", ""),
@@ -893,18 +1155,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return messages
 
     def _load_response_history(self, response_id: str) -> list:
-        if not response_id:
-            return []
-        with RESPONSE_HISTORY_LOCK:
-            history = RESPONSE_HISTORY.get(response_id, [])
-            return json.loads(json.dumps(history, ensure_ascii=False))
+        return _response_store_get_messages(response_id) if response_id else []
 
-    def _store_response_history(self, response_id: str, messages: list, output: list):
-        history = list(messages) + self._responses_output_to_messages(output)
-        with RESPONSE_HISTORY_LOCK:
-            RESPONSE_HISTORY[response_id] = json.loads(json.dumps(history, ensure_ascii=False))
-            while len(RESPONSE_HISTORY) > RESPONSE_HISTORY_MAX:
-                RESPONSE_HISTORY.pop(next(iter(RESPONSE_HISTORY)))
+    def _store_response_history(self, response: dict, messages: list, previous_response_id: str = None):
+        _response_store_save(response, messages, previous_response_id)
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
@@ -934,6 +1188,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if first.get("role") != "system" or first.get("content") != req["instructions"]:
                 messages.insert(0, {"role": "system", "content": req["instructions"]})
 
+        messages = _compact_messages(
+            messages,
+            CONFIG.get("max_history_messages", 40),
+            CONFIG.get("max_history_chars", 60000),
+            CONFIG.get("max_tool_output_chars", 12000),
+        )
+
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
@@ -949,6 +1210,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        if _should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                if retry_calls:
+                    text, tool_calls = retry_text, retry_calls
+                    break
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -961,7 +1228,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
-        self._store_response_history(rid, messages, output)
+        resp_obj = {"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
+                    "model": model_name, "output": output,
+                    "usage": self._response_usage(prompt, text)}
+        if previous_response_id:
+            resp_obj["previous_response_id"] = previous_response_id
+        if req.get("store", True) is not False:
+            self._store_response_history(resp_obj, messages, previous_response_id)
 
         if req.get("stream"):
             self.send_response(200)
@@ -973,14 +1246,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._write_sse("response.created", ev)
             for output_index, item in enumerate(output):
                 self._write_response_stream_item(output_index, item)
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": self._response_usage(prompt, text)}
             self._write_sse("response.completed", {"type": "response.completed", "response": resp_obj})
             self.wfile.flush()
         else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": self._response_usage(prompt, text)})
+            self.send_json(resp_obj)
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
@@ -1000,6 +1269,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 result = block.get("content", "")
                 if not isinstance(result, str):
                     result = json.dumps(result, ensure_ascii=False)
+                result = _truncate_text(result, CONFIG.get("max_tool_output_chars", 12000))
                 parts.append(f"[Tool result for {block.get('tool_use_id', '')}]: {result}")
         return "\n".join(p for p in parts if p)
 
@@ -1024,6 +1294,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         continue
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
+                    elif block.get("type") in ("thinking", "redacted_thinking"):
+                        thinking = block.get("thinking") or block.get("data") or ""
+                        if thinking:
+                            text_parts.append(f"[Previous assistant thinking preserved but hidden from user]: {thinking}")
                     elif block.get("type") == "tool_use":
                         tool_calls.append({
                             "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -1116,7 +1390,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = self._anthropic_tools_to_openai(req.get("tools", []))
         tool_choice = self._anthropic_tool_choice_to_openai(req.get("tool_choice", "auto"))
-        prompt = messages_to_prompt(self._anthropic_to_openai_messages(req), tools, tool_choice)
+        anthropic_messages = self._anthropic_to_openai_messages(req)
+        prompt = messages_to_prompt(anthropic_messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
@@ -1126,6 +1401,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
             return
+        if _should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                if retry_calls:
+                    text, tool_calls = retry_text, retry_calls
+                    break
 
         usage = _usage(prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"

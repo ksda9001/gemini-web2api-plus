@@ -3,7 +3,6 @@ import json
 import time
 import uuid
 import re
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -12,11 +11,33 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
+from .agent import (
+    ResponseStore,
+    build_tool_retry_prompt,
+    compact_messages,
+    response_call_to_tool_call,
+    response_content_to_message_parts,
+    response_messages_from_output,
+    should_retry_tool_call,
+    truncate_tool_output,
+)
 from . import __version__
 
-RESPONSE_HISTORY = {}
-RESPONSE_HISTORY_LOCK = threading.Lock()
-RESPONSE_HISTORY_MAX = 100
+RESPONSE_STORE = None
+
+
+def _response_store() -> ResponseStore:
+    global RESPONSE_STORE
+    if RESPONSE_STORE is None:
+        RESPONSE_STORE = ResponseStore(
+            CONFIG.get("response_store_path", "responses.db"),
+            CONFIG.get("response_store_ttl_sec", 86400),
+            CONFIG.get("response_store_max_rows", 1000),
+            CONFIG.get("max_history_messages", 40),
+            CONFIG.get("max_history_chars", 60000),
+            CONFIG.get("max_tool_output_chars", 12000),
+        )
+    return RESPONSE_STORE
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -95,7 +116,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if self.path.startswith("/v1/responses/"):
+                response_id = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
+                response = _response_store().get_response(response_id)
+                if response is None:
+                    self.send_json({"error": {"message": "response not found"}}, 404)
+                else:
+                    self.send_json(response)
+            elif self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
@@ -157,7 +185,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        chat_messages = compact_messages(
+            req.get("messages", []),
+            CONFIG.get("max_history_messages", 40),
+            CONFIG.get("max_history_chars", 60000),
+            CONFIG.get("max_tool_output_chars", 12000),
+        )
+        prompt, images = messages_to_prompt(chat_messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -191,6 +225,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+        if should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
+                try:
+                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                except Exception:
+                    break
+                retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                if retry_calls:
+                    text, tool_calls = retry_clean, retry_calls
+                    break
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -300,41 +345,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         })
 
     def _response_call_to_tool_call(self, item: dict, fallback_index: int = 0) -> dict:
-        function = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
-        name = item.get("name") or function.get("name", "")
-        arguments = item.get("arguments", function.get("arguments", "{}"))
-        if arguments is None:
-            arguments = "{}"
-        elif not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
-        call_id = item.get("call_id") or item.get("id") or f"call_{fallback_index}"
-        return {
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": arguments},
-        }
+        return response_call_to_tool_call(item, fallback_index)
 
     def _response_content_to_message_parts(self, content) -> tuple:
-        text_parts = []
-        tool_calls = []
-        if isinstance(content, list):
-            for index, part in enumerate(content):
-                if not isinstance(part, dict):
-                    if part is not None:
-                        text_parts.append(str(part))
-                    continue
-                part_type = part.get("type")
-                if part_type in ("input_text", "output_text", "text"):
-                    text_parts.append(part.get("text", ""))
-                elif part_type == "function_call":
-                    tool_calls.append(self._response_call_to_tool_call(part, index))
-                elif part_type in ("image", "image_url", "input_image"):
-                    text_parts.append("[Image input not supported in this API. Please describe the image in text.]")
-        elif isinstance(content, str):
-            text_parts.append(content)
-        elif content is not None:
-            text_parts.append(str(content))
-        return "\n".join(p for p in text_parts if p), tool_calls
+        return response_content_to_message_parts(content)
 
     def _responses_input_to_messages(self, input_items) -> list:
         messages = []
@@ -361,6 +375,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 output = item.get("output", "")
                 if not isinstance(output, str):
                     output = json.dumps(output, ensure_ascii=False)
+                output = truncate_tool_output(output, CONFIG.get("max_tool_output_chars", 12000))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": item.get("call_id", ""),
@@ -380,38 +395,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return messages
 
     def _responses_output_to_messages(self, output: list) -> list:
-        messages = []
-        for index, item in enumerate(output or []):
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "function_call":
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [self._response_call_to_tool_call(item, index)],
-                })
-            elif item.get("type") == "message":
-                text, tool_calls = self._response_content_to_message_parts(item.get("content", []))
-                message = {"role": item.get("role", "assistant"), "content": text or None}
-                if tool_calls:
-                    message["role"] = "assistant"
-                    message["tool_calls"] = tool_calls
-                messages.append(message)
-        return messages
+        return response_messages_from_output(output)
 
     def _load_response_history(self, response_id: str) -> list:
-        if not response_id:
-            return []
-        with RESPONSE_HISTORY_LOCK:
-            history = RESPONSE_HISTORY.get(response_id, [])
-            return json.loads(json.dumps(history, ensure_ascii=False))
+        return _response_store().get_messages(response_id) if response_id else []
 
-    def _store_response_history(self, response_id: str, messages: list, output: list):
-        history = list(messages) + self._responses_output_to_messages(output)
-        with RESPONSE_HISTORY_LOCK:
-            RESPONSE_HISTORY[response_id] = json.loads(json.dumps(history, ensure_ascii=False))
-            while len(RESPONSE_HISTORY) > RESPONSE_HISTORY_MAX:
-                RESPONSE_HISTORY.pop(next(iter(RESPONSE_HISTORY)))
+    def _store_response_history(self, response: dict, messages: list, output: list, previous_response_id: str = None):
+        _response_store().save(response, messages, output, previous_response_id)
 
     def _handle_responses(self, body: bytes):
         req = self._parse_body(body)
@@ -443,6 +433,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if first.get("role") != "system" or first.get("content") != req["instructions"]:
                 messages.insert(0, {"role": "system", "content": req["instructions"]})
 
+        messages = compact_messages(
+            messages,
+            CONFIG.get("max_history_messages", 40),
+            CONFIG.get("max_history_chars", 60000),
+            CONFIG.get("max_tool_output_chars", 12000),
+        )
+
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
@@ -462,6 +459,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+        if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
+                try:
+                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                except Exception:
+                    break
+                retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                if retry_calls:
+                    text, tool_calls = retry_clean, retry_calls
+                    break
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -474,7 +482,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
-        self._store_response_history(rid, messages, output)
+        resp_obj = {"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
+                    "model": model_name, "output": output,
+                    "usage": self._response_usage(prompt, text)}
+        if previous_response_id:
+            resp_obj["previous_response_id"] = previous_response_id
+        if req.get("store", True) is not False:
+            self._store_response_history(resp_obj, messages, output, previous_response_id)
 
         if req.get("stream"):
             self._start_sse()
@@ -482,14 +496,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._write_sse("response.created", ev)
             for output_index, item in enumerate(output):
                 self._write_response_stream_item(output_index, item)
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": self._response_usage(prompt, text)}
             self._write_sse("response.completed", {"type": "response.completed", "response": resp_obj})
             self.wfile.flush()
         else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": self._response_usage(prompt, text)})
+            self.send_json(resp_obj)
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -508,6 +518,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 result = block.get("content", "")
                 if not isinstance(result, str):
                     result = json.dumps(result, ensure_ascii=False)
+                result = truncate_tool_output(result, CONFIG.get("max_tool_output_chars", 12000))
                 parts.append(f"[Tool result for {block.get('tool_use_id', '')}]: {result}")
         return "\n".join(p for p in parts if p)
 
@@ -532,6 +543,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         continue
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
+                    elif block.get("type") in ("thinking", "redacted_thinking"):
+                        thinking = block.get("thinking") or block.get("data") or ""
+                        if thinking:
+                            text_parts.append(f"[Previous assistant thinking preserved but hidden from user]: {thinking}")
                     elif block.get("type") == "tool_use":
                         tool_calls.append({
                             "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -624,7 +639,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = self._anthropic_tools_to_openai(req.get("tools", []))
         tool_choice = self._anthropic_tool_choice_to_openai(req.get("tool_choice", "auto"))
-        prompt, images = messages_to_prompt(self._anthropic_to_openai_messages(req), tools, tool_choice)
+        anthropic_messages = self._anthropic_to_openai_messages(req)
+        prompt, images = messages_to_prompt(anthropic_messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
@@ -638,6 +654,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+        if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
+            for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
+                try:
+                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                except Exception:
+                    break
+                retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                if retry_calls:
+                    text, tool_calls = retry_clean, retry_calls
+                    break
         usage = _usage(prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         if tool_calls:
