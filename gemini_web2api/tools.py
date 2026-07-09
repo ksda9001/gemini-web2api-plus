@@ -65,6 +65,40 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+def openai_tools_from_request(req: dict):
+    """Return OpenAI-style tools, accepting both tools and legacy functions."""
+    if req.get("tools"):
+        return req.get("tools")
+    functions = req.get("functions")
+    if not functions:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            },
+        }
+        for fn in functions
+    ]
+
+
+def openai_tool_choice_from_request(req: dict):
+    """Return OpenAI-style tool_choice, accepting legacy function_call."""
+    if "tool_choice" in req:
+        return req.get("tool_choice", "auto")
+    function_call = req.get("function_call")
+    if function_call is None:
+        return "auto"
+    if function_call in ("auto", "none"):
+        return function_call
+    if isinstance(function_call, dict) and function_call.get("name"):
+        return {"type": "function", "function": {"name": function_call["name"]}}
+    return "auto"
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -194,14 +228,14 @@ def _normalize_tool_call_payload(payload) -> list:
 
 def _json_from_single_fence(text: str) -> str:
     stripped = text.strip()
-    match = re.fullmatch(r'```(?:json|tool_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
+    match = re.fullmatch(r'```(?:json|tool_call|function_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
     return match.group(1).strip() if match else stripped
 
 
 def parse_tool_calls(text: str) -> tuple:
     """Extract tool_call blocks or raw JSON calls. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = r'```(?:tool_call|function_call)\s*\n(.*?)\n```'
     clean_parts = []
     last_end = 0
     for m in re.finditer(pattern, text, re.DOTALL):
@@ -329,6 +363,53 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(p for p in parts if p), images
 
 
+def _decode_json_values(text: str) -> list:
+    values = []
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            break
+        values.append(value)
+        index = end
+    return values
+
+
+def _google_call_from_payload(payload) -> list:
+    if isinstance(payload, dict) and isinstance(payload.get("tool_calls"), list):
+        payload = payload["tool_calls"]
+
+    items = payload if isinstance(payload, list) else [payload]
+    calls = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if isinstance(function, dict):
+            name = function.get("name") or item.get("name")
+            args = function.get("arguments", item.get("arguments", item.get("args", {})))
+        elif item.get("type") == "tool_use":
+            name = item.get("name")
+            args = item.get("input", item.get("arguments", item.get("args", {})))
+        else:
+            name = item.get("name") or item.get("tool") or item.get("tool_name")
+            args = item.get("args", item.get("arguments", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"value": args}
+        if isinstance(name, str) and name.strip():
+            calls.append({"name": name.strip(), "args": args if isinstance(args, dict) else {}})
+    return calls
+
+
 def parse_google_function_calls(text: str) -> tuple:
     """Extract function_call blocks from model output.
 
@@ -339,31 +420,128 @@ def parse_google_function_calls(text: str) -> tuple:
 
     Returns (clean_text, [{"name": ..., "args": ...}])
     """
+    text = text or ""
     function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)\n```'
-    pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
     clean = text
-    for pattern in [pattern1, pattern2]:
-        for match in re.findall(pattern, clean, re.DOTALL):
-            try:
-                data = json.loads(match.strip())
-                if "name" in data:
-                    function_calls.append({
-                        "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
-                    })
-            except (json.JSONDecodeError, KeyError):
-                pass
-        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
-    if not function_calls and clean.strip().startswith("{"):
+
+    fence_pattern = r'```(?:function_call|tool_call|json)?\s*\n(.*?)\n```'
+    for match in re.finditer(fence_pattern, text, re.DOTALL):
+        payload_text = match.group(1).strip()
         try:
-            data = json.loads(clean.strip())
-            if "name" in data and ("args" in data or "arguments" in data):
-                function_calls.append({
-                    "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
-                })
-                clean = ""
-        except (json.JSONDecodeError, KeyError):
+            function_calls.extend(_google_call_from_payload(json.loads(payload_text)))
+        except json.JSONDecodeError:
             pass
+    clean = re.sub(fence_pattern, '', clean, flags=re.DOTALL).strip()
+
+    if not function_calls:
+        prefix_pattern = r'(?:^|\n)(?:function_call|tool_call)\s*\n'
+        prefix_match = re.search(prefix_pattern, clean)
+        if prefix_match:
+            payload_text = clean[prefix_match.end():].strip()
+            for value in _decode_json_values(payload_text):
+                function_calls.extend(_google_call_from_payload(value))
+            if function_calls:
+                clean = clean[:prefix_match.start()].strip()
+
+    if not function_calls:
+        stripped = clean.strip()
+        if stripped.startswith(("{", "[")):
+            for value in _decode_json_values(stripped):
+                function_calls.extend(_google_call_from_payload(value))
+            if function_calls:
+                clean = ""
     return clean, function_calls
+
+
+def google_tools_to_openai(req: dict) -> list:
+    """Convert Google native functionDeclarations to OpenAI-style tools."""
+    converted = []
+    tool_config = req.get("toolConfig", {})
+    fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+    if fc_mode == "NONE":
+        return converted
+    for tool_group in req.get("tools") or []:
+        for fn in tool_group.get("functionDeclarations", []):
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters") or fn.get("parametersJsonSchema") or {},
+                },
+            })
+    return converted
+
+
+def google_tool_choice_to_openai(req: dict):
+    """Convert Google functionCallingConfig to OpenAI-style tool_choice."""
+    fc_config = req.get("toolConfig", {}).get("functionCallingConfig", {})
+    mode = fc_config.get("mode", "AUTO")
+    allowed = fc_config.get("allowedFunctionNames", [])
+    if mode == "NONE":
+        return "none"
+    if mode == "ANY":
+        if len(allowed) == 1:
+            return {"type": "function", "function": {"name": allowed[0]}}
+        return "required"
+    return "auto"
+
+
+def google_contents_to_messages(req: dict) -> list:
+    """Convert Google native contents/systemInstruction to OpenAI-style messages for retry heuristics."""
+    messages = []
+    sys_inst = req.get("systemInstruction")
+    if sys_inst:
+        sys_parts = sys_inst.get("parts", [])
+        sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
+        if sys_text:
+            messages.append({"role": "system", "content": sys_text})
+
+    for content in req.get("contents", []):
+        role = "assistant" if content.get("role") == "model" else "user"
+        text_parts = []
+        for part in content.get("parts", []):
+            if part.get("text"):
+                text_parts.append(part["text"])
+            elif part.get("functionCall"):
+                fc = part["functionCall"]
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": fc.get("name", ""),
+                            "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False),
+                        },
+                    }],
+                })
+            elif part.get("functionResponse"):
+                fr = part["functionResponse"]
+                messages.append({
+                    "role": "tool",
+                    "name": fr.get("name", ""),
+                    "content": json.dumps(fr.get("response", {}), ensure_ascii=False),
+                })
+        if text_parts:
+            messages.append({"role": role, "content": "\n".join(text_parts)})
+    return messages
+
+
+def build_google_tool_retry_prompt(prompt: str, req: dict) -> str:
+    """Build a retry prompt that asks Gemini Web for a Google-compatible function_call."""
+    choice = google_tool_choice_to_openai(req)
+    target = ""
+    if isinstance(choice, dict):
+        fn_name = choice.get("function", {}).get("name", "")
+        if fn_name:
+            target = f' Call only "{fn_name}".'
+    return (
+        f"{prompt}\n\n"
+        "[System instruction]: Your previous answer did not call a function even though a function call is required or needed. "
+        "Return ONLY one valid function_call block or raw JSON function call object now. "
+        "Use this exact shape: ```function_call\n{\"name\":\"func_name\",\"args\":{}}\n``` "
+        "Do not explain, do not include markdown outside the function call, and do not provide normal text."
+        f"{target}"
+    )

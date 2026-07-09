@@ -34,6 +34,7 @@ import argparse
 import base64
 import threading
 import sqlite3
+from contextlib import contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -114,6 +115,12 @@ def log(msg: str):
     if CONFIG["log_requests"]:
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
+
+
+def _usage(prompt: str, text: str) -> dict:
+    p = len(prompt) // 4
+    c = len(text or "") // 4
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
 def load_cookie() -> tuple:
@@ -393,6 +400,38 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+def openai_tools_from_request(req: dict):
+    if req.get("tools"):
+        return req.get("tools")
+    functions = req.get("functions")
+    if not functions:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            },
+        }
+        for fn in functions
+    ]
+
+
+def openai_tool_choice_from_request(req: dict):
+    if "tool_choice" in req:
+        return req.get("tool_choice", "auto")
+    function_call = req.get("function_call")
+    if function_call is None:
+        return "auto"
+    if function_call in ("auto", "none"):
+        return function_call
+    if isinstance(function_call, dict) and function_call.get("name"):
+        return {"type": "function", "function": {"name": function_call["name"]}}
+    return "auto"
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> str:
     """Convert OpenAI messages to prompt string."""
     parts = []
@@ -506,14 +545,14 @@ def _normalize_tool_call_payload(payload) -> list:
 
 def _json_from_single_fence(text: str) -> str:
     stripped = text.strip()
-    match = re.fullmatch(r'```(?:json|tool_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
+    match = re.fullmatch(r'```(?:json|tool_call|function_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
     return match.group(1).strip() if match else stripped
 
 
 def parse_tool_calls(text: str) -> tuple:
     """Extract tool_call blocks or raw JSON calls. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = r'```(?:tool_call|function_call)\s*\n(.*?)\n```'
     clean_parts = []
     last_end = 0
     for m in re.finditer(pattern, text, re.DOTALL):
@@ -539,8 +578,13 @@ def parse_tool_calls(text: str) -> tuple:
 
 ACTION_RE = re.compile(
     r"(\b(create|generate|write|save|edit|modify|delete|remove|read|cat|list|ls|inspect|check|"
-    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search)\b"
-    r"|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查)",
+    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search|"
+    r"implement|add|update|upgrade|refactor|review|debug|diagnose|investigate|verify|"
+    r"validate|repair|solve|resolve|setup|configure|rename|move|copy)\b"
+    r"|帮我|看下|看看|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|"
+    r"测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查|实现|新增|添加|更新|升级|"
+    r"调整|移动|复制|重命名|重构|优化|分析|定位|排查|调试|验证|确认|解决|处理|报错|"
+    r"触发|失效|失败|异常|故障|不生效|没生效|不起作用|运行一下|跑一下|修一下|改一下)",
     re.IGNORECASE,
 )
 
@@ -634,7 +678,9 @@ def _should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_
     if tool_choice == "required" or isinstance(tool_choice, dict):
         return True
     user_text = _any_user_action_text(messages) or _latest_user_text(messages)
-    return bool(user_text and ACTION_RE.search(user_text))
+    if user_text and ACTION_RE.search(user_text):
+        return True
+    return bool(text and ACTION_RE.search(text))
 
 
 def _build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
@@ -671,6 +717,19 @@ def _response_store_init():
     return con
 
 
+@contextmanager
+def _response_store_connection():
+    con = _response_store_init()
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
 def _response_store_save(response: dict, messages: list, previous_response_id: str = None):
     now = int(time.time())
     response = dict(response)
@@ -684,7 +743,7 @@ def _response_store_save(response: dict, messages: list, previous_response_id: s
         CONFIG.get("max_tool_output_chars", 12000),
     )
     with RESPONSE_HISTORY_LOCK:
-        with _response_store_init() as con:
+        with _response_store_connection() as con:
             con.execute(
                 "INSERT OR REPLACE INTO responses "
                 "(id, created_at, updated_at, previous_response_id, model, response_json, messages_json) "
@@ -706,7 +765,7 @@ def _response_store_save(response: dict, messages: list, previous_response_id: s
 
 def _response_store_get_response(response_id: str):
     with RESPONSE_HISTORY_LOCK:
-        with _response_store_init() as con:
+        with _response_store_connection() as con:
             row = con.execute("SELECT response_json FROM responses WHERE id = ?", (response_id,)).fetchone()
     return json.loads(row[0]) if row else None
 
@@ -715,7 +774,7 @@ def _response_store_get_messages(response_id: str) -> list:
     if not response_id:
         return []
     with RESPONSE_HISTORY_LOCK:
-        with _response_store_init() as con:
+        with _response_store_connection() as con:
             row = con.execute("SELECT messages_json FROM responses WHERE id = ?", (response_id,)).fetchone()
     return json.loads(row[0]) if row else []
 
@@ -788,6 +847,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _write_sse(self, event: str, data: dict):
         self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
         self.wfile.flush()
+
+    def _parse_body(self, body: bytes) -> dict:
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -888,8 +953,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        tools = req.get("tools")
-        tool_choice = req.get("tool_choice", "auto")
+        tools = openai_tools_from_request(req)
+        tool_choice = openai_tool_choice_from_request(req)
         chat_messages = _compact_messages(
             req.get("messages", []),
             CONFIG.get("max_history_messages", 40),

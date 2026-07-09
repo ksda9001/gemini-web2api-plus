@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 
 
 DEFAULT_RESPONSE_STORE_PATH = "responses.db"
@@ -17,8 +18,13 @@ DEFAULT_MAX_HISTORY_CHARS = 60000
 ACTION_RE = re.compile(
     r"("
     r"\b(create|generate|write|save|edit|modify|delete|remove|read|cat|list|ls|inspect|check|"
-    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search)\b"
-    r"|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查"
+    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search|"
+    r"implement|add|update|upgrade|refactor|review|debug|diagnose|investigate|verify|"
+    r"validate|repair|solve|resolve|setup|configure|rename|move|copy)\b"
+    r"|帮我|看下|看看|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|"
+    r"测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查|实现|新增|添加|更新|升级|"
+    r"调整|移动|复制|重命名|重构|优化|分析|定位|排查|调试|验证|确认|解决|处理|报错|"
+    r"触发|失效|失败|异常|故障|不生效|没生效|不起作用|运行一下|跑一下|修一下|改一下"
     r")",
     re.IGNORECASE,
 )
@@ -146,9 +152,7 @@ def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_c
         return True
     user_text = any_user_action_text(messages) or latest_user_text(messages)
     if not user_text or not ACTION_RE.search(user_text):
-        return False
-    if not text:
-        return True
+        return bool(text and ACTION_RE.search(text))
     return True
 
 
@@ -203,13 +207,26 @@ class ResponseStore:
         con.execute("PRAGMA synchronous=NORMAL")
         return con
 
+    @contextmanager
+    def _connection(self):
+        con = self._connect()
+        try:
+            yield con
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            if self.path != ":memory:":
+                con.close()
+
     def _init(self):
         if self._ready:
             return
         with self._lock:
             if self._ready:
                 return
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     """
                     CREATE TABLE IF NOT EXISTS responses (
@@ -256,7 +273,7 @@ class ResponseStore:
             self.max_tool_output_chars,
         )
         with self._lock:
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     """
                     INSERT OR REPLACE INTO responses
@@ -278,13 +295,13 @@ class ResponseStore:
 
     def get_response(self, response_id: str):
         self._init()
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute("SELECT response_json FROM responses WHERE id = ?", (response_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
     def get_messages(self, response_id: str) -> list:
         self._init()
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute("SELECT messages_json FROM responses WHERE id = ?", (response_id,)).fetchone()
         return json.loads(row[0]) if row else []
 

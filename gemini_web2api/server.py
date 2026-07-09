@@ -9,7 +9,18 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import (
+    build_google_tool_retry_prompt,
+    google_contents_to_messages,
+    google_contents_to_prompt,
+    google_tool_choice_to_openai,
+    google_tools_to_openai,
+    messages_to_prompt,
+    openai_tool_choice_from_request,
+    openai_tools_from_request,
+    parse_google_function_calls,
+    parse_tool_calls,
+)
 from .multimodal import upload_image, fetch_image_bytes
 from .agent import (
     ResponseStore,
@@ -183,8 +194,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        tools = req.get("tools")
-        tool_choice = req.get("tool_choice", "auto")
+        tools = openai_tools_from_request(req)
+        tool_choice = openai_tool_choice_from_request(req)
         chat_messages = compact_messages(
             req.get("messages", []),
             CONFIG.get("max_history_messages", 40),
@@ -708,6 +719,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_config = req.get("toolConfig", {})
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+        tools = google_tools_to_openai(req)
+        tool_choice = google_tool_choice_to_openai(req)
+        google_messages = google_contents_to_messages(req)
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
@@ -755,15 +769,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             log("Warning: empty response from Gemini")
 
         response_parts = []
+        function_calls = []
         if has_tools and text:
             clean_text, function_calls = parse_google_function_calls(text)
+            if not function_calls and should_retry_tool_call(google_messages, tools, tool_choice, text, function_calls):
+                for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
+                    retry_prompt = build_google_tool_retry_prompt(prompt, req)
+                    try:
+                        retry_text = generate(retry_prompt, model_id, think_mode, file_refs, extra_fields)
+                    except Exception:
+                        break
+                    retry_clean, retry_calls = parse_google_function_calls(retry_text or "")
+                    if retry_calls:
+                        text, clean_text, function_calls = retry_text, retry_clean, retry_calls
+                        break
             if function_calls:
-                if clean_text:
-                    response_parts.append({"text": clean_text})
                 for fc in function_calls:
                     response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
+            elif clean_text:
+                response_parts.append({"text": clean_text})
             else:
-                response_parts.append({"text": text})
+                response_parts.append({"text": text or ""})
         else:
             response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
 
