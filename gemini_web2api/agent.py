@@ -1,0 +1,341 @@
+"""Agent compatibility helpers for tool-using clients."""
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+
+
+DEFAULT_RESPONSE_STORE_PATH = "responses.db"
+DEFAULT_RESPONSE_STORE_TTL_SEC = 86400
+DEFAULT_RESPONSE_STORE_MAX_ROWS = 1000
+DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000
+DEFAULT_MAX_HISTORY_MESSAGES = 40
+DEFAULT_MAX_HISTORY_CHARS = 60000
+
+ACTION_RE = re.compile(
+    r"("
+    r"\b(create|generate|write|save|edit|modify|delete|remove|read|cat|list|ls|inspect|check|"
+    r"run|execute|test|install|build|fix|patch|commit|push|open|download|fetch|search)\b"
+    r"|创建|生成|写入|保存|修改|编辑|删除|读取|查看|列出|运行|执行|测试|安装|构建|修复|提交|推送|打开|下载|搜索|检查"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def json_clone(value):
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def text_from_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "tool_result":
+                    parts.append(text_from_content(item.get("content", "")))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def latest_user_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = text_from_content(msg.get("content", ""))
+            if text.strip():
+                return text
+    return ""
+
+
+def any_user_action_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = text_from_content(msg.get("content", ""))
+            if text.strip() and ACTION_RE.search(text):
+                return text
+    return ""
+
+
+def truncate_text(text, max_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head_len = max_chars // 2
+    tail_len = max_chars - head_len
+    omitted = len(text) - head_len - tail_len
+    marker = f"\n\n[... truncated {omitted} characters ...]\n\n"
+    return text[:head_len] + marker + text[-tail_len:]
+
+
+def truncate_tool_output(output, max_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS) -> str:
+    return truncate_text(output, max_chars)
+
+
+def _truncate_message_content(message: dict, max_tool_chars: int) -> dict:
+    msg = dict(message)
+    if msg.get("role") == "tool":
+        msg["content"] = truncate_tool_output(msg.get("content", ""), max_tool_chars)
+    elif isinstance(msg.get("content"), list):
+        content = []
+        for item in msg["content"]:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                item = dict(item)
+                item["content"] = truncate_tool_output(item.get("content", ""), max_tool_chars)
+            content.append(item)
+        msg["content"] = content
+    return msg
+
+
+def compact_messages(
+    messages: list,
+    max_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
+    max_chars: int = DEFAULT_MAX_HISTORY_CHARS,
+    max_tool_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+) -> list:
+    """Deterministically trim stored history while preserving task and recent tool loop."""
+    messages = [_truncate_message_content(m, max_tool_chars) for m in (messages or []) if isinstance(m, dict)]
+    if not messages:
+        return []
+
+    system = [m for m in messages if m.get("role") == "system"][:1]
+    non_system = [m for m in messages if m.get("role") != "system"]
+    first_user = []
+    for m in non_system:
+        if m.get("role") == "user":
+            first_user = [m]
+            break
+
+    protected_ids = {id(m) for m in system + first_user}
+    recent = []
+    for m in reversed(non_system):
+        if id(m) not in protected_ids:
+            recent.append(m)
+        if len(recent) >= max_messages:
+            break
+    compacted = system + first_user + list(reversed(recent))
+
+    encoded = json.dumps(compacted, ensure_ascii=False)
+    if len(encoded) > max_chars and len(compacted) > len(system) + len(first_user):
+        budget = max(1, max_messages // 2)
+        recent = list(reversed(list(reversed(non_system))[:budget]))
+        compacted = system + first_user + [{
+            "role": "system",
+            "content": "[Earlier conversation compacted. Keep following the original task and recent tool results.]",
+        }] + recent
+    return json_clone(compacted)
+
+
+def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_calls) -> bool:
+    if not tools or tool_choice == "none" or tool_calls:
+        return False
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict):
+        return True
+    user_text = any_user_action_text(messages) or latest_user_text(messages)
+    if not user_text or not ACTION_RE.search(user_text):
+        return False
+    if not text:
+        return True
+    return True
+
+
+def build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
+    target = ""
+    if isinstance(tool_choice, dict):
+        fn_name = tool_choice.get("function", {}).get("name", "")
+        if fn_name:
+            target = f' Call only "{fn_name}".'
+    return (
+        f"{prompt}\n\n"
+        "[System instruction]: Your previous answer did not call a tool even though a tool is required or needed. "
+        "Return ONLY one valid tool_call block or raw JSON tool call object now. "
+        "Do not explain, do not include markdown outside the tool call, and do not provide normal text."
+        f"{target}"
+    )
+
+
+class ResponseStore:
+    """SQLite-backed response/message store for Responses API previous_response_id."""
+
+    def __init__(
+        self,
+        path: str = DEFAULT_RESPONSE_STORE_PATH,
+        ttl_sec: int = DEFAULT_RESPONSE_STORE_TTL_SEC,
+        max_rows: int = DEFAULT_RESPONSE_STORE_MAX_ROWS,
+        max_history_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
+        max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+    ):
+        self.path = path or DEFAULT_RESPONSE_STORE_PATH
+        self.ttl_sec = int(ttl_sec or DEFAULT_RESPONSE_STORE_TTL_SEC)
+        self.max_rows = int(max_rows or DEFAULT_RESPONSE_STORE_MAX_ROWS)
+        self.max_history_messages = int(max_history_messages or DEFAULT_MAX_HISTORY_MESSAGES)
+        self.max_history_chars = int(max_history_chars or DEFAULT_MAX_HISTORY_CHARS)
+        self.max_tool_output_chars = int(max_tool_output_chars or DEFAULT_MAX_TOOL_OUTPUT_CHARS)
+        self._lock = threading.Lock()
+        self._ready = False
+        self._memory_connection = None
+
+    def _connect(self):
+        if self.path == ":memory:":
+            if self._memory_connection is None:
+                self._memory_connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+            return self._memory_connection
+        if self.path != ":memory:":
+            directory = os.path.dirname(os.path.abspath(self.path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+        con = sqlite3.connect(self.path, timeout=30)
+        con.execute("PRAGMA journal_mode=DELETE")
+        con.execute("PRAGMA synchronous=NORMAL")
+        return con
+
+    def _init(self):
+        if self._ready:
+            return
+        with self._lock:
+            if self._ready:
+                return
+            with self._connect() as con:
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS responses (
+                        id TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        previous_response_id TEXT,
+                        model TEXT,
+                        response_json TEXT NOT NULL,
+                        messages_json TEXT NOT NULL,
+                        output_json TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute("CREATE INDEX IF NOT EXISTS idx_responses_updated ON responses(updated_at)")
+            self._ready = True
+
+    def _prune(self, con):
+        now = int(time.time())
+        if self.ttl_sec > 0:
+            con.execute("DELETE FROM responses WHERE updated_at < ?", (now - self.ttl_sec,))
+        if self.max_rows > 0:
+            con.execute(
+                """
+                DELETE FROM responses
+                WHERE id NOT IN (
+                    SELECT id FROM responses ORDER BY updated_at DESC LIMIT ?
+                )
+                """,
+                (self.max_rows,),
+            )
+
+    def save(self, response: dict, messages: list, output: list, previous_response_id: str = None):
+        self._init()
+        now = int(time.time())
+        response = json_clone(response)
+        response["created_at"] = response.get("created_at") or now
+        if previous_response_id:
+            response["previous_response_id"] = previous_response_id
+        history = compact_messages(
+            list(messages or []) + list(response_messages_from_output(output or [])),
+            self.max_history_messages,
+            self.max_history_chars,
+            self.max_tool_output_chars,
+        )
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO responses
+                    (id, created_at, updated_at, previous_response_id, model, response_json, messages_json, output_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        response["id"],
+                        int(response.get("created_at") or now),
+                        now,
+                        previous_response_id,
+                        response.get("model", ""),
+                        json.dumps(response, ensure_ascii=False),
+                        json.dumps(history, ensure_ascii=False),
+                        json.dumps(output or [], ensure_ascii=False),
+                    ),
+                )
+                self._prune(con)
+
+    def get_response(self, response_id: str):
+        self._init()
+        with self._connect() as con:
+            row = con.execute("SELECT response_json FROM responses WHERE id = ?", (response_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def get_messages(self, response_id: str) -> list:
+        self._init()
+        with self._connect() as con:
+            row = con.execute("SELECT messages_json FROM responses WHERE id = ?", (response_id,)).fetchone()
+        return json.loads(row[0]) if row else []
+
+
+def response_call_to_tool_call(item: dict, fallback_index: int = 0) -> dict:
+    function = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+    name = item.get("name") or function.get("name", "")
+    arguments = item.get("arguments", function.get("arguments", "{}"))
+    if arguments is None:
+        arguments = "{}"
+    elif not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    call_id = item.get("call_id") or item.get("id") or f"call_{fallback_index}"
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def response_content_to_message_parts(content) -> tuple:
+    text_parts = []
+    tool_calls = []
+    if isinstance(content, list):
+        for index, part in enumerate(content):
+            if not isinstance(part, dict):
+                if part is not None:
+                    text_parts.append(str(part))
+                continue
+            part_type = part.get("type")
+            if part_type in ("input_text", "output_text", "text"):
+                text_parts.append(part.get("text", ""))
+            elif part_type == "function_call":
+                tool_calls.append(response_call_to_tool_call(part, index))
+            elif part_type in ("image", "image_url", "input_image"):
+                text_parts.append("[Image input not supported in this API. Please describe the image in text.]")
+    elif isinstance(content, str):
+        text_parts.append(content)
+    elif content is not None:
+        text_parts.append(str(content))
+    return "\n".join(p for p in text_parts if p), tool_calls
+
+
+def response_messages_from_output(output: list) -> list:
+    messages = []
+    for index, item in enumerate(output or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            messages.append({"role": "assistant", "content": None, "tool_calls": [response_call_to_tool_call(item, index)]})
+        elif item.get("type") == "message":
+            text, tool_calls = response_content_to_message_parts(item.get("content", []))
+            message = {"role": item.get("role", "assistant"), "content": text or None}
+            if tool_calls:
+                message["role"] = "assistant"
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+    return messages

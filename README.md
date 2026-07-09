@@ -116,6 +116,12 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-key
 export ANTHROPIC_MODEL=gemini-3.5-flash
 ```
 
+Agent compatibility includes:
+- automatic tool-call repair retry when the model describes an action instead of calling a tool
+- SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
+- deterministic truncation/compaction of long tool outputs and old history
+- Anthropic `thinking` / `redacted_thinking` preservation in prompt context
+
 ## Available Models
 
 | Model | Description | Output |
@@ -205,11 +211,25 @@ Create `config.json` in the same directory:
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "response_store_path": "responses.db",
+  "response_store_ttl_sec": 86400,
+  "response_store_max_rows": 1000,
+  "max_tool_output_chars": 12000,
+  "max_history_messages": 40,
+  "max_history_chars": 60000,
+  "tool_retry_attempts": 1
 }
 ```
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+Agent-related config:
+- `response_store_path`: SQLite file for Responses API state; mount it as a volume in Docker if you want history to survive container recreation
+- `response_store_ttl_sec`: history retention window
+- `max_tool_output_chars`: head/tail truncation limit for shell/tool outputs stored in context
+- `max_history_messages` / `max_history_chars`: deterministic context compaction limits
+- `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 ## Docker
 

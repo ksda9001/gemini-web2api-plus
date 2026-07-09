@@ -16,6 +16,13 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    "response_store_path": "responses.db",
+    "response_store_ttl_sec": 86400,
+    "response_store_max_rows": 1000,
+    "max_tool_output_chars": 12000,
+    "max_history_messages": 40,
+    "max_history_chars": 60000,
+    "tool_retry_attempts": 1,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
