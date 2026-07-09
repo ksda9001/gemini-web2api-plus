@@ -369,7 +369,8 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
                 "[System instruction]: You have access to tools. "
                 "To call a tool, respond with:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "Only use tool_call blocks when needed.\n\n"
+                'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
+                "Only use tool_call blocks or raw JSON tool call objects when needed.\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
             )
     for msg in messages:
@@ -401,24 +402,94 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _tool_arguments_to_json(arguments) -> str:
+    if arguments is None:
+        return "{}"
+    if isinstance(arguments, str):
+        return arguments.strip() or "{}"
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _normalize_tool_call(data: dict):
+    if not isinstance(data, dict):
+        return None
+
+    name = None
+    arguments = {}
+
+    function = data.get("function")
+    if isinstance(function, dict):
+        name = function.get("name") or data.get("name")
+        arguments = function.get("arguments", data.get("arguments", {}))
+    elif data.get("type") == "tool_use":
+        name = data.get("name")
+        arguments = data.get("input", data.get("arguments", {}))
+    else:
+        name = data.get("name") or data.get("tool") or data.get("tool_name")
+        if "arguments" in data:
+            arguments = data.get("arguments")
+        elif "args" in data:
+            arguments = data.get("args")
+        else:
+            return None
+
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    call_id = data.get("id") or data.get("call_id") or f"call_{uuid.uuid4().hex[:8]}"
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name.strip(),
+            "arguments": _tool_arguments_to_json(arguments),
+        },
+    }
+
+
+def _normalize_tool_call_payload(payload) -> list:
+    if isinstance(payload, dict) and isinstance(payload.get("tool_calls"), list):
+        payload = payload["tool_calls"]
+
+    items = payload if isinstance(payload, list) else [payload]
+    tool_calls = []
+    for item in items:
+        tool_call = _normalize_tool_call(item)
+        if tool_call:
+            tool_calls.append(tool_call)
+    return tool_calls
+
+
+def _json_from_single_fence(text: str) -> str:
+    stripped = text.strip()
+    match = re.fullmatch(r'```(?:json|tool_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
+    return match.group(1).strip() if match else stripped
+
+
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+    """Extract tool_call blocks or raw JSON calls. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
     pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+    clean_parts = []
+    last_end = 0
+    for m in re.finditer(pattern, text, re.DOTALL):
+        clean_parts.append(text[last_end:m.start()])
+        last_end = m.end()
         try:
-            data = json.loads(match.strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
+            data = json.loads(m.group(1).strip())
+            tool_calls.extend(_normalize_tool_call_payload(data))
+        except json.JSONDecodeError:
             pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    clean_parts.append(text[last_end:])
+    clean = "".join(clean_parts).strip()
+    if not tool_calls and clean:
+        try:
+            data = json.loads(_json_from_single_fence(clean))
+            raw_tool_calls = _normalize_tool_call_payload(data)
+            if raw_tool_calls:
+                return "", raw_tool_calls
+        except json.JSONDecodeError:
+            pass
     return clean, tool_calls
 
 
