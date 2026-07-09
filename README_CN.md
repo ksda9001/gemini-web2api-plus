@@ -20,6 +20,7 @@
 - **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
+- **语言保持**: agent 面向用户的回复会从最新用户输入语言开场, 同时保持工具名、路径、命令和 JSON 原样
 
 ## 快速开始
 
@@ -111,6 +112,7 @@ Agent 兼容能力包括:
 - 使用 SQLite 保存 Responses 历史, 支持 `previous_response_id` 和 `GET /v1/responses/{id}`
 - 对超长工具输出和旧历史做确定性截断/压缩
 - 在 prompt 上下文中保留 Anthropic `thinking` / `redacted_thinking` 信息
+- 按最新真实用户输入追加语言约束, 让状态/最终文本从用户语言开场；工具结果不会参与语言判断
 
 ## 可用模型
 

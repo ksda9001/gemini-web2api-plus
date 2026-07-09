@@ -20,6 +20,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+- **Language Preservation**: user-facing agent replies start in the latest user's language while tool names, paths, commands, and JSON stay unchanged
 
 ## Quick Start
 
@@ -121,6 +122,7 @@ Agent compatibility includes:
 - SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
 - deterministic truncation/compaction of long tool outputs and old history
 - Anthropic `thinking` / `redacted_thinking` preservation in prompt context
+- recency-weighted language guidance so status/final text starts in the latest user's language, while tool results are ignored for language detection
 
 ## Available Models
 
