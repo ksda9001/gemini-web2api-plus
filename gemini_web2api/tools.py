@@ -7,6 +7,20 @@ import io
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
+AGENT_BEHAVIOR_INSTRUCTION = (
+    "Agent behavior:\n"
+    "- If the user asks to create, edit, read, delete, list, move, or inspect files; "
+    "run commands; install dependencies; execute tests; open URLs; or otherwise act on the local environment, "
+    "call the appropriate tool instead of describing what you would do.\n"
+    "- When the user asks to generate or create a file, write the file through tools. "
+    "Do not merely print the file contents in a normal text answer unless the user explicitly asks to only see the contents.\n"
+    "- Work step by step. After receiving a tool result, decide whether another tool call is needed and continue "
+    "until the user's task is complete.\n"
+    "- Do not finish with a text answer while required file edits, commands, tests, or inspections remain undone.\n"
+    "- Use the same natural language as the user's latest request for final answers and user-facing status text. "
+    "Keep tool names, file paths, commands, and JSON arguments in their required syntax.\n"
+)
+
 
 def _compress_b64_if_needed(b64: str) -> str:
     """Compress image if base64 is too large for text embedding."""
@@ -58,6 +72,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     """
     parts = []
     images = []
+
+    parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
 
     if tools and tool_choice != "none":
         tool_defs = []

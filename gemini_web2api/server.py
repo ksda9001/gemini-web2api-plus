@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -12,6 +13,10 @@ from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
+
+RESPONSE_HISTORY = {}
+RESPONSE_HISTORY_LOCK = threading.Lock()
+RESPONSE_HISTORY_MAX = 100
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -294,6 +299,120 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "item": item,
         })
 
+    def _response_call_to_tool_call(self, item: dict, fallback_index: int = 0) -> dict:
+        function = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+        name = item.get("name") or function.get("name", "")
+        arguments = item.get("arguments", function.get("arguments", "{}"))
+        if arguments is None:
+            arguments = "{}"
+        elif not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        call_id = item.get("call_id") or item.get("id") or f"call_{fallback_index}"
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+
+    def _response_content_to_message_parts(self, content) -> tuple:
+        text_parts = []
+        tool_calls = []
+        if isinstance(content, list):
+            for index, part in enumerate(content):
+                if not isinstance(part, dict):
+                    if part is not None:
+                        text_parts.append(str(part))
+                    continue
+                part_type = part.get("type")
+                if part_type in ("input_text", "output_text", "text"):
+                    text_parts.append(part.get("text", ""))
+                elif part_type == "function_call":
+                    tool_calls.append(self._response_call_to_tool_call(part, index))
+                elif part_type in ("image", "image_url", "input_image"):
+                    text_parts.append("[Image input not supported in this API. Please describe the image in text.]")
+        elif isinstance(content, str):
+            text_parts.append(content)
+        elif content is not None:
+            text_parts.append(str(content))
+        return "\n".join(p for p in text_parts if p), tool_calls
+
+    def _responses_input_to_messages(self, input_items) -> list:
+        messages = []
+        if isinstance(input_items, str):
+            return [{"role": "user", "content": input_items}]
+        if not isinstance(input_items, list):
+            return messages
+
+        for index, item in enumerate(input_items):
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+            if item_type == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self._response_call_to_tool_call(item, index)],
+                })
+            elif item_type == "function_call_output":
+                output = item.get("output", "")
+                if not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "name": item.get("name", "") or item.get("call_id", ""),
+                    "content": output,
+                })
+            elif item_type == "reasoning":
+                continue
+            else:
+                role = item.get("role", "user")
+                text, tool_calls = self._response_content_to_message_parts(item.get("content", ""))
+                message = {"role": role, "content": text or None}
+                if tool_calls:
+                    message["role"] = "assistant"
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
+        return messages
+
+    def _responses_output_to_messages(self, output: list) -> list:
+        messages = []
+        for index, item in enumerate(output or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self._response_call_to_tool_call(item, index)],
+                })
+            elif item.get("type") == "message":
+                text, tool_calls = self._response_content_to_message_parts(item.get("content", []))
+                message = {"role": item.get("role", "assistant"), "content": text or None}
+                if tool_calls:
+                    message["role"] = "assistant"
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
+        return messages
+
+    def _load_response_history(self, response_id: str) -> list:
+        if not response_id:
+            return []
+        with RESPONSE_HISTORY_LOCK:
+            history = RESPONSE_HISTORY.get(response_id, [])
+            return json.loads(json.dumps(history, ensure_ascii=False))
+
+    def _store_response_history(self, response_id: str, messages: list, output: list):
+        history = list(messages) + self._responses_output_to_messages(output)
+        with RESPONSE_HISTORY_LOCK:
+            RESPONSE_HISTORY[response_id] = json.loads(json.dumps(history, ensure_ascii=False))
+            while len(RESPONSE_HISTORY) > RESPONSE_HISTORY_MAX:
+                RESPONSE_HISTORY.pop(next(iter(RESPONSE_HISTORY)))
+
     def _handle_responses(self, body: bytes):
         req = self._parse_body(body)
         if req is None:
@@ -307,41 +426,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         input_items = req.get("input", [])
         tools = req.get("tools")
-        messages = []
-        if req.get("instructions"):
-            messages.append({"role": "system", "content": req["instructions"]})
-        if isinstance(input_items, str):
-            messages.append({"role": "user", "content": input_items})
-        elif isinstance(input_items, list):
-            for item in input_items:
-                if isinstance(item, str):
-                    messages.append({"role": "user", "content": item})
-                elif isinstance(item, dict):
-                    if item.get("type") == "function_call_output":
-                        messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                                         "name": item.get("name", ""), "content": item.get("output", "")})
-                    elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
-                        cp = item.get("content", [])
-                        text_acc, tc_list = "", []
-                        if isinstance(cp, list):
-                            for c in cp:
-                                if isinstance(c, dict):
-                                    if c.get("type") == "output_text": text_acc += c.get("text", "")
-                                    elif c.get("type") == "function_call": tc_list.append(c)
-                        elif isinstance(cp, str):
-                            text_acc = cp
-                        m = {"role": "assistant", "content": text_acc or None}
-                        if tc_list:
-                            m["tool_calls"] = [{"id": tc.get("call_id", f"call_{i}"), "type": "function",
-                                                "function": {"name": tc.get("name",""), "arguments": tc.get("arguments","{}")}}
-                                               for i, tc in enumerate(tc_list)]
-                        messages.append(m)
-                    else:
-                        role = item.get("role", "user")
-                        content = item.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
-                        messages.append({"role": role, "content": content})
+        previous_response_id = req.get("previous_response_id")
+        previous_messages = self._load_response_history(previous_response_id)
+        current_messages = self._responses_input_to_messages(input_items)
+
+        if previous_messages:
+            messages = previous_messages + current_messages
+        else:
+            messages = []
+            if req.get("instructions"):
+                messages.append({"role": "system", "content": req["instructions"]})
+            messages.extend(current_messages)
+
+        if previous_messages and req.get("instructions"):
+            first = messages[0] if messages else {}
+            if first.get("role") != "system" or first.get("content") != req["instructions"]:
+                messages.insert(0, {"role": "system", "content": req["instructions"]})
 
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
@@ -373,6 +473,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if text or not tool_calls:
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+
+        self._store_response_history(rid, messages, output)
 
         if req.get("stream"):
             self._start_sse()
