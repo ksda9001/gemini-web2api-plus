@@ -74,6 +74,38 @@ gemini
 - `POST /v1beta/models/{model}:generateContent` — 非流式生成
 - `POST /v1beta/models/{model}:streamGenerateContent` — 流式生成 (SSE)
 
+### Agent 客户端
+
+Codex CLI、Claude Code、Copilot 这类编程 agent 需要流式工具调用协议，不只是普通聊天补全。本服务提供以下兼容端点:
+
+| 客户端 | Base URL | API 形态 |
+|------|----------|----------|
+| Codex CLI | `http://localhost:8081/v1` | OpenAI Responses API (`/v1/responses`) |
+| Claude Code | `http://localhost:8081` | Anthropic Messages API (`/v1/messages`) |
+| Copilot / OpenAI 兼容 agent | `http://localhost:8081/v1` | Chat Completions (`/v1/chat/completions`) |
+
+Codex 配置示例:
+
+```toml
+model_provider = "gemini-web2api"
+model = "gemini-3.5-flash"
+
+[model_providers.gemini-web2api]
+name = "gemini-web2api"
+base_url = "http://localhost:8081/v1"
+wire_api = "responses"
+env_key = "GEMINI_WEB2API_KEY"
+requires_openai_auth = false
+```
+
+Claude Code 环境变量示例:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_AUTH_TOKEN=sk-your-key
+export ANTHROPIC_MODEL=gemini-3.5-flash
+```
+
 ## 可用模型
 
 | 模型 | 说明 | 输出量 |

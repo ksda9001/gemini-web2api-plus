@@ -437,6 +437,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_sse(self, event: str, data: dict):
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -486,6 +490,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
+            elif self.path == "/v1/messages":
+                self.handle_anthropic_messages(body)
             elif ":generateContent" in self.path:
                 self._handle_google_generate(body, stream=False)
             elif ":streamGenerateContent" in self.path:
@@ -574,14 +580,29 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
-            # Stream mode with tools: send as single chunk (need full parse for tool_calls)
+            # Stream mode with tools: send as a single standards-shaped chunk.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
+            if tool_calls:
+                delta = {"role": "assistant", "content": None, "tool_calls": []}
+                for index, tc in enumerate(tool_calls):
+                    delta["tool_calls"].append({
+                        "index": index,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    })
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": "tool_calls"}]}
+            else:
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant", "content": text or ""}, "finish_reason": "stop"}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -593,6 +614,76 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text)//4,
                           "total_tokens": (len(prompt)+len(text))//4},
             })
+
+    def _response_usage(self, prompt: str, text: str) -> dict:
+        input_tokens = len(prompt) // 4
+        output_tokens = len(text or "") // 4
+        return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}
+
+    def _write_response_stream_item(self, output_index: int, item: dict):
+        self._write_sse("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {**item, "status": "in_progress", **({"content": []} if item["type"] == "message" else {})},
+        })
+
+        if item["type"] == "function_call":
+            arguments = item.get("arguments", "")
+            if arguments:
+                self._write_sse("response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "delta": arguments,
+                })
+            self._write_sse("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": item["id"],
+                "output_index": output_index,
+                "call_id": item["call_id"],
+                "name": item["name"],
+                "arguments": arguments,
+            })
+        elif item["type"] == "message":
+            for content_index, part in enumerate(item["content"]):
+                if part.get("type") != "output_text":
+                    continue
+                text = part.get("text", "")
+                self._write_sse("response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                })
+                if text:
+                    self._write_sse("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "delta": text,
+                    })
+                self._write_sse("response.output_text.done", {
+                    "type": "response.output_text.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "text": text,
+                })
+                self._write_sse("response.content_part.done", {
+                    "type": "response.content_part.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": part,
+                })
+
+        self._write_sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        })
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
@@ -675,26 +766,191 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
-                if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
-                elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+            self._write_sse("response.created", ev)
+            for output_index, item in enumerate(output):
+                self._write_response_stream_item(output_index, item)
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
+                        "usage": self._response_usage(prompt, text)}
+            self._write_sse("response.completed", {"type": "response.completed", "response": resp_obj})
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
+                            "usage": self._response_usage(prompt, text)})
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
+
+    def _anthropic_content_to_text(self, content):
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return "" if content is None else str(content)
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_result":
+                result = block.get("content", "")
+                if not isinstance(result, str):
+                    result = json.dumps(result, ensure_ascii=False)
+                parts.append(f"[Tool result for {block.get('tool_use_id', '')}]: {result}")
+        return "\n".join(p for p in parts if p)
+
+    def _anthropic_to_openai_messages(self, req: dict) -> list:
+        messages = []
+        system = req.get("system")
+        if isinstance(system, str) and system:
+            messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            text = self._anthropic_content_to_text(system)
+            if text:
+                messages.append({"role": "system", "content": text})
+
+        for msg in req.get("messages", []):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "assistant" and isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        tool_calls.append({
+                            "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                            },
+                        })
+                converted = {"role": "assistant", "content": "\n".join(text_parts) or None}
+                if tool_calls:
+                    converted["tool_calls"] = tool_calls
+                messages.append(converted)
+            else:
+                messages.append({"role": role, "content": self._anthropic_content_to_text(content)})
+        return messages
+
+    def _anthropic_tools_to_openai(self, tools: list) -> list:
+        converted = []
+        for tool in tools or []:
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                },
+            })
+        return converted
+
+    def _anthropic_tool_choice_to_openai(self, tool_choice):
+        if not isinstance(tool_choice, dict):
+            return tool_choice or "auto"
+        choice_type = tool_choice.get("type")
+        if choice_type == "none":
+            return "none"
+        if choice_type in ("any", "auto"):
+            return "required" if choice_type == "any" else "auto"
+        if choice_type == "tool" and tool_choice.get("name"):
+            return {"type": "function", "function": {"name": tool_choice["name"]}}
+        return "auto"
+
+    def _write_anthropic_stream_text(self, message_id: str, model_name: str, text: str, usage: dict):
+        self._write_sse("message_start", {"type": "message_start", "message": {
+            "id": message_id, "type": "message", "role": "assistant", "model": model_name,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": 0},
+        }})
+        self._write_sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+        if text:
+            self._write_sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+        self._write_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+        self._write_sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": usage["completion_tokens"]}})
+        self._write_sse("message_stop", {"type": "message_stop"})
+
+    def _write_anthropic_stream_tool(self, message_id: str, model_name: str, tool_calls: list, usage: dict):
+        self._write_sse("message_start", {"type": "message_start", "message": {
+            "id": message_id, "type": "message", "role": "assistant", "model": model_name,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": 0},
+        }})
+        for index, tc in enumerate(tool_calls):
+            fn = tc["function"]
+            self._write_sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+                "type": "tool_use", "id": tc["id"], "name": fn["name"], "input": {},
+            }})
+            self._write_sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                "type": "input_json_delta", "partial_json": fn.get("arguments", "{}"),
+            }})
+            self._write_sse("content_block_stop", {"type": "content_block_stop", "index": index})
+        self._write_sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": usage["completion_tokens"]}})
+        self._write_sse("message_stop", {"type": "message_stop"})
+
+    def _safe_json_object(self, text: str) -> dict:
+        try:
+            value = json.loads(text or "{}")
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def handle_anthropic_messages(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
+            return
+        model_name, model_id, think_mode, err = self._resolve_model(req.get("model", CONFIG["default_model"]))
+        if err:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": err}}, 400)
+            return
+
+        tools = self._anthropic_tools_to_openai(req.get("tools", []))
+        tool_choice = self._anthropic_tool_choice_to_openai(req.get("tool_choice", "auto"))
+        prompt, images = messages_to_prompt(self._anthropic_to_openai_messages(req), tools, tool_choice)
+        if not prompt.strip():
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
+            return
+
+        try:
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools if tool_choice != "none" else None)
+        except Exception as e:
+            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        usage = _usage(prompt, text or "")
+        message_id = f"msg_{uuid.uuid4().hex[:16]}"
+        if tool_calls:
+            content = [{"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": self._safe_json_object(tc["function"].get("arguments"))} for tc in tool_calls]
+            stop_reason = "tool_use"
+        else:
+            content = [{"type": "text", "text": text or ""}]
+            stop_reason = "end_turn"
+
+        if req.get("stream"):
+            self._start_sse()
+            if tool_calls:
+                self._write_anthropic_stream_tool(message_id, model_name, tool_calls, usage)
+            else:
+                self._write_anthropic_stream_text(message_id, model_name, text or "", usage)
+            return
+
+        self.send_json({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model_name,
+            "content": content,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
+        })
+
 
     def _parse_google_model_from_path(self):
         """Extract model name from /v1beta/models/{model}:method path."""

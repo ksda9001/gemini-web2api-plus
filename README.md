@@ -84,6 +84,38 @@ Supports Google native API endpoints:
 - `POST /v1beta/models/{model}:generateContent` — non-streaming
 - `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
 
+### Agent Clients
+
+Codex CLI, Claude Code, and Copilot-style coding agents require streaming tool-use protocols, not just plain chat completions. This server exposes the compatible endpoints below:
+
+| Client | Base URL | API surface |
+|--------|----------|-------------|
+| Codex CLI | `http://localhost:8081/v1` | OpenAI Responses API (`/v1/responses`) |
+| Claude Code | `http://localhost:8081` | Anthropic Messages API (`/v1/messages`) |
+| Copilot / OpenAI-compatible agents | `http://localhost:8081/v1` | Chat Completions (`/v1/chat/completions`) |
+
+Example Codex provider:
+
+```toml
+model_provider = "gemini-web2api"
+model = "gemini-3.5-flash"
+
+[model_providers.gemini-web2api]
+name = "gemini-web2api"
+base_url = "http://localhost:8081/v1"
+wire_api = "responses"
+env_key = "GEMINI_WEB2API_KEY"
+requires_openai_auth = false
+```
+
+Example Claude Code environment:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_AUTH_TOKEN=sk-your-key
+export ANTHROPIC_MODEL=gemini-3.5-flash
+```
+
 ## Available Models
 
 | Model | Description | Output |
