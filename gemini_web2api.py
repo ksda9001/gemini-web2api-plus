@@ -393,6 +393,52 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def _text_from_content_for_language(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _is_tool_result_text(text: str) -> bool:
+    return text.lstrip().startswith("[Tool result for ")
+
+
+def _latest_user_text_for_language(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _text_from_content_for_language(msg.get("content", ""))
+            if text.strip() and not _is_tool_result_text(text):
+                return text
+    return ""
+
+
+def _response_language_instruction(messages: list) -> str:
+    latest_user_text = _latest_user_text_for_language(messages)
+    if latest_user_text and _CJK_RE.search(latest_user_text):
+        return (
+            "[System instruction]: 用户最新请求使用中文、日文或韩文。所有面向用户的说明、状态和最终回答"
+            "必须从第一句话开始使用同一种语言；不要用英文开场。工具名、文件路径、命令和 JSON 参数保持原样。"
+        )
+    return (
+        "[System instruction]: Reply in the same natural language as the user's latest request. "
+        "Start in that language. Keep tool names, file paths, commands, and JSON syntax unchanged."
+    )
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> str:
     """Convert OpenAI messages to prompt string."""
     parts = []
@@ -443,6 +489,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
         else:
             parts.append(content if content else "")
+    parts.append(_response_language_instruction(messages))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -1477,6 +1524,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 parts.append(f"[Assistant]: {text}")
             else:
                 parts.append(text)
+        language_messages = [
+            {"role": "user", "content": " ".join(
+                p.get("text", "") for p in content.get("parts", [])
+                if isinstance(p, dict) and p.get("text")
+            )}
+            for content in req.get("contents", [])
+            if content.get("role", "user") != "model"
+        ]
+        parts.append(_response_language_instruction(language_messages))
         return "\n\n".join(p for p in parts if p)
 
     def _handle_google_generate(self, body: bytes, stream: bool):
