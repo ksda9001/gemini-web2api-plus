@@ -32,6 +32,7 @@ import os
 import hashlib
 import argparse
 import base64
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -62,6 +63,10 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
+
+RESPONSE_HISTORY = {}
+RESPONSE_HISTORY_LOCK = threading.Lock()
+RESPONSE_HISTORY_MAX = 100
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -352,10 +357,39 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
-def messages_to_prompt(messages: list, tools: list = None) -> str:
+AGENT_BEHAVIOR_INSTRUCTION = (
+    "Agent behavior:\n"
+    "- If the user asks to create, edit, read, delete, list, move, or inspect files; "
+    "run commands; install dependencies; execute tests; open URLs; or otherwise act on the local environment, "
+    "call the appropriate tool instead of describing what you would do.\n"
+    "- When the user asks to generate or create a file, write the file through tools. "
+    "Do not merely print the file contents in a normal text answer unless the user explicitly asks to only see the contents.\n"
+    "- Work step by step. After receiving a tool result, decide whether another tool call is needed and continue "
+    "until the user's task is complete.\n"
+    "- Do not finish with a text answer while required file edits, commands, tests, or inspections remain undone.\n"
+    "- Use the same natural language as the user's latest request for final answers and user-facing status text. "
+    "Keep tool names, file paths, commands, and JSON arguments in their required syntax.\n"
+)
+
+
+def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
+    if tool_choice == "none":
+        return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
+    if tool_choice == "required":
+        return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only."
+    if isinstance(tool_choice, dict):
+        fn_name = tool_choice.get("function", {}).get("name", "")
+        if fn_name:
+            return f'\n\nIMPORTANT: You MUST call the tool "{fn_name}". Do not call other tools.'
+    return ""
+
+
+def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> str:
     """Convert OpenAI messages to prompt string."""
     parts = []
-    if tools:
+    parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
+
+    if tools and tool_choice != "none":
         tool_defs = []
         for tool in tools:
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
@@ -372,6 +406,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
                 'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
                 "Only use tool_call blocks or raw JSON tool call objects when needed.\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"{_build_tool_choice_instruction(tool_choice, tool_defs)}"
             )
     for msg in messages:
         role = msg.get("role", "user")
@@ -605,7 +640,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt = messages_to_prompt(req.get("messages", []), tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -613,7 +649,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and not tools:
+        if stream and (not tools or tool_choice == "none"):
             # True streaming: forward chunks as they arrive
             try:
                 self.send_response(200)
@@ -640,7 +676,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools if tool_choice != "none" else None)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -756,6 +792,120 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "item": item,
         })
 
+    def _response_call_to_tool_call(self, item: dict, fallback_index: int = 0) -> dict:
+        function = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+        name = item.get("name") or function.get("name", "")
+        arguments = item.get("arguments", function.get("arguments", "{}"))
+        if arguments is None:
+            arguments = "{}"
+        elif not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        call_id = item.get("call_id") or item.get("id") or f"call_{fallback_index}"
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+
+    def _response_content_to_message_parts(self, content) -> tuple:
+        text_parts = []
+        tool_calls = []
+        if isinstance(content, list):
+            for index, part in enumerate(content):
+                if not isinstance(part, dict):
+                    if part is not None:
+                        text_parts.append(str(part))
+                    continue
+                part_type = part.get("type")
+                if part_type in ("input_text", "output_text", "text"):
+                    text_parts.append(part.get("text", ""))
+                elif part_type == "function_call":
+                    tool_calls.append(self._response_call_to_tool_call(part, index))
+                elif part_type in ("image", "image_url", "input_image"):
+                    text_parts.append("[Image input not supported in this API. Please describe the image in text.]")
+        elif isinstance(content, str):
+            text_parts.append(content)
+        elif content is not None:
+            text_parts.append(str(content))
+        return "\n".join(p for p in text_parts if p), tool_calls
+
+    def _responses_input_to_messages(self, input_items) -> list:
+        messages = []
+        if isinstance(input_items, str):
+            return [{"role": "user", "content": input_items}]
+        if not isinstance(input_items, list):
+            return messages
+
+        for index, item in enumerate(input_items):
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+            if item_type == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self._response_call_to_tool_call(item, index)],
+                })
+            elif item_type == "function_call_output":
+                output = item.get("output", "")
+                if not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "name": item.get("name", "") or item.get("call_id", ""),
+                    "content": output,
+                })
+            elif item_type == "reasoning":
+                continue
+            else:
+                role = item.get("role", "user")
+                text, tool_calls = self._response_content_to_message_parts(item.get("content", ""))
+                message = {"role": role, "content": text or None}
+                if tool_calls:
+                    message["role"] = "assistant"
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
+        return messages
+
+    def _responses_output_to_messages(self, output: list) -> list:
+        messages = []
+        for index, item in enumerate(output or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self._response_call_to_tool_call(item, index)],
+                })
+            elif item.get("type") == "message":
+                text, tool_calls = self._response_content_to_message_parts(item.get("content", []))
+                message = {"role": item.get("role", "assistant"), "content": text or None}
+                if tool_calls:
+                    message["role"] = "assistant"
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
+        return messages
+
+    def _load_response_history(self, response_id: str) -> list:
+        if not response_id:
+            return []
+        with RESPONSE_HISTORY_LOCK:
+            history = RESPONSE_HISTORY.get(response_id, [])
+            return json.loads(json.dumps(history, ensure_ascii=False))
+
+    def _store_response_history(self, response_id: str, messages: list, output: list):
+        history = list(messages) + self._responses_output_to_messages(output)
+        with RESPONSE_HISTORY_LOCK:
+            RESPONSE_HISTORY[response_id] = json.loads(json.dumps(history, ensure_ascii=False))
+            while len(RESPONSE_HISTORY) > RESPONSE_HISTORY_MAX:
+                RESPONSE_HISTORY.pop(next(iter(RESPONSE_HISTORY)))
+
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
         req = json.loads(body)
@@ -767,54 +917,35 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         input_items = req.get("input", [])
         tools = req.get("tools")
+        previous_response_id = req.get("previous_response_id")
+        previous_messages = self._load_response_history(previous_response_id)
+        current_messages = self._responses_input_to_messages(input_items)
 
-        messages = []
-        if req.get("instructions"):
-            messages.append({"role": "system", "content": req["instructions"]})
-        if isinstance(input_items, str):
-            messages.append({"role": "user", "content": input_items})
-        elif isinstance(input_items, list):
-            for item in input_items:
-                if isinstance(item, str):
-                    messages.append({"role": "user", "content": item})
-                elif isinstance(item, dict):
-                    if item.get("type") == "function_call_output":
-                        messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                                         "name": item.get("name", ""), "content": item.get("output", "")})
-                    elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
-                        cp = item.get("content", [])
-                        text_acc, tc_list = "", []
-                        if isinstance(cp, list):
-                            for c in cp:
-                                if isinstance(c, dict):
-                                    if c.get("type") == "output_text": text_acc += c.get("text", "")
-                                    elif c.get("type") == "function_call": tc_list.append(c)
-                        elif isinstance(cp, str):
-                            text_acc = cp
-                        m = {"role": "assistant", "content": text_acc or None}
-                        if tc_list:
-                            m["tool_calls"] = [{"id": tc.get("call_id", f"call_{i}"), "type": "function",
-                                                "function": {"name": tc.get("name",""), "arguments": tc.get("arguments","{}")}}
-                                               for i, tc in enumerate(tc_list)]
-                        messages.append(m)
-                    else:
-                        role = item.get("role", "user")
-                        content = item.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
-                        messages.append({"role": role, "content": content})
+        if previous_messages:
+            messages = previous_messages + current_messages
+        else:
+            messages = []
+            if req.get("instructions"):
+                messages.append({"role": "system", "content": req["instructions"]})
+            messages.extend(current_messages)
+
+        if previous_messages and req.get("instructions"):
+            first = messages[0] if messages else {}
+            if first.get("role") != "system" or first.get("content") != req["instructions"]:
+                messages.insert(0, {"role": "system", "content": req["instructions"]})
 
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt = messages_to_prompt(messages, tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools if tool_choice != "none" else None)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -829,6 +960,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if text or not tool_calls:
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+
+        self._store_response_history(rid, messages, output)
 
         if req.get("stream"):
             self.send_response(200)
@@ -983,7 +1116,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = self._anthropic_tools_to_openai(req.get("tools", []))
         tool_choice = self._anthropic_tool_choice_to_openai(req.get("tool_choice", "auto"))
-        prompt, images = messages_to_prompt(self._anthropic_to_openai_messages(req), tools, tool_choice)
+        prompt = messages_to_prompt(self._anthropic_to_openai_messages(req), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
