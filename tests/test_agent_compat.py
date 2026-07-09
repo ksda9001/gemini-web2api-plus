@@ -8,6 +8,7 @@ from pathlib import Path
 
 import gemini_web2api.server as server
 from gemini_web2api.config import CONFIG
+from gemini_web2api.tools import messages_to_prompt
 
 
 TOOLS = [{
@@ -70,6 +71,38 @@ class HttpHarness:
 
 
 class AgentCompatTests(unittest.TestCase):
+    def test_prompt_adds_recent_chinese_language_instruction(self):
+        prompt, _ = messages_to_prompt([
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "请创建 test.txt"},
+        ], TOOLS)
+
+        self.assertIn("不要用英文开场", prompt)
+        self.assertGreater(prompt.rfind("不要用英文开场"), prompt.rfind("请创建 test.txt"))
+        self.assertTrue(prompt.rstrip().endswith("JSON 参数保持原样。"))
+
+    def test_prompt_adds_same_language_instruction_for_english(self):
+        prompt, _ = messages_to_prompt([
+            {"role": "user", "content": "Please create test.txt"},
+        ], TOOLS)
+
+        self.assertIn("Reply in the same natural language", prompt)
+        self.assertNotIn("不要用英文开场", prompt)
+
+    def test_prompt_ignores_tool_result_when_detecting_user_language(self):
+        prompt, _ = messages_to_prompt([
+            {"role": "user", "content": "请列出当前目录"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "shell_command", "arguments": '{"command":"pwd"}'},
+            }]},
+            {"role": "user", "content": "[Tool result for call_1]: C:\\Users\\Casper\\project"},
+        ], TOOLS)
+
+        self.assertIn("不要用英文开场", prompt)
+        self.assertNotIn("Reply in the same natural language", prompt)
+
     def test_responses_retries_when_model_describes_tool_action(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [
