@@ -736,6 +736,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_config = req.get("toolConfig", {})
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+        if stream and fc_mode == "AUTO" and not CONFIG.get("google_stream_auto_tools", False):
+            req = dict(req)
+            req["tools"] = []
+            has_tools = False
         tools = google_tools_to_openai(req)
         tool_choice = google_tool_choice_to_openai(req)
         google_messages = google_contents_to_messages(req)
@@ -743,6 +747,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
+        max_google_prompt_chars = int(CONFIG.get("max_google_prompt_chars", 18000) or 0)
+        if max_google_prompt_chars > 0 and len(prompt) > max_google_prompt_chars:
+            omitted = len(prompt) - max_google_prompt_chars
+            prompt = (
+                f"[Earlier Google native context omitted: {omitted} characters. "
+                "Continue using the recent conversation below.]\n\n"
+                + prompt[-max_google_prompt_chars:]
+            )
 
         file_refs = _upload_images(images)
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")

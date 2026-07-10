@@ -22,6 +22,8 @@ DEFAULT_CONFIG = {
     "max_tool_output_chars": 12000,
     "max_history_messages": 40,
     "max_history_chars": 60000,
+    "max_google_prompt_chars": 18000,
+    "google_stream_auto_tools": False,
     "tool_retry_attempts": 1,
 }
 

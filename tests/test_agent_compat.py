@@ -58,7 +58,9 @@ class HttpHarness:
         self.prompts = []
         self._responses = iter(responses)
         self._original_generate = server.generate
+        self._original_generate_stream = server.generate_stream
         server.generate = self._fake_generate
+        server.generate_stream = self._fake_generate_stream
         server.RESPONSE_STORE = None
         CONFIG.update({
             "api_keys": [],
@@ -69,6 +71,8 @@ class HttpHarness:
             "max_tool_output_chars": 80,
             "max_history_messages": 20,
             "max_history_chars": 10000,
+            "max_google_prompt_chars": 18000,
+            "google_stream_auto_tools": False,
             "tool_retry_attempts": 1,
         })
         self.httpd = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
@@ -79,6 +83,10 @@ class HttpHarness:
     def _fake_generate(self, prompt, *args, **kwargs):
         self.prompts.append(prompt)
         return next(self._responses)
+
+    def _fake_generate_stream(self, prompt, *args, **kwargs):
+        self.prompts.append(prompt)
+        yield next(self._responses)
 
     def post(self, path, payload):
         req = urllib.request.Request(
@@ -119,6 +127,7 @@ class HttpHarness:
         self.httpd.shutdown()
         self.httpd.server_close()
         server.generate = self._original_generate
+        server.generate_stream = self._original_generate_stream
         server.RESPONSE_STORE = None
 
 
@@ -148,6 +157,8 @@ class SingleFileHttpHarness:
             "max_tool_output_chars": 80,
             "max_history_messages": 20,
             "max_history_chars": 10000,
+            "max_google_prompt_chars": 18000,
+            "google_stream_auto_tools": False,
             "tool_retry_attempts": 1,
         })
         self.httpd = server.ThreadedServer(("127.0.0.1", 0), self.module.GeminiHandler)
@@ -690,6 +701,43 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(parts[0]["functionCall"]["args"]["command"], "Get-ChildItem")
                 self.assertEqual(len(harness.prompts), 2)
                 self.assertIn("previous answer", harness.prompts[1])
+            finally:
+                harness.close()
+
+    def test_google_stream_auto_tools_uses_text_stream_without_tool_prompt(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, ["完整回答"])
+            try:
+                events = harness.post_sse("/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse", {
+                    "contents": [{"role": "user", "parts": [{"text": "普通聊天，不需要工具"}]}],
+                    "tools": GOOGLE_TOOLS,
+                    "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                })
+                data_events = [e["data"] for e in events if isinstance(e["data"], dict)]
+                self.assertEqual(data_events[0]["candidates"][0]["content"]["parts"][0]["text"], "完整回答")
+                self.assertEqual(data_events[-1]["candidates"][0]["finishReason"], "STOP")
+                self.assertEqual(len(harness.prompts), 1)
+                self.assertNotIn("# Tool Use", harness.prompts[0])
+            finally:
+                harness.close()
+
+    def test_google_api_trims_oversized_prompt_before_upstream(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, ["ok"])
+            CONFIG["max_google_prompt_chars"] = 120
+            try:
+                response = harness.post("/v1beta/models/gemini-3.5-flash:generateContent", {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "old-" + ("x" * 500)}]},
+                        {"role": "user", "parts": [{"text": "RECENT_QUESTION"}]},
+                    ],
+                })
+                text = response["candidates"][0]["content"]["parts"][0]["text"]
+                self.assertEqual(text, "ok")
+                self.assertEqual(len(harness.prompts), 1)
+                self.assertLess(len(harness.prompts[0]), 260)
+                self.assertIn("Earlier Google native context omitted", harness.prompts[0])
+                self.assertIn("RECENT_QUESTION", harness.prompts[0])
             finally:
                 harness.close()
 
