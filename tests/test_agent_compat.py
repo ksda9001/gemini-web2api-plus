@@ -13,6 +13,7 @@ from pathlib import Path
 import gemini_web2api.server as server
 from gemini_web2api.agent import ResponseStore
 from gemini_web2api.config import CONFIG
+from gemini_web2api.tools import parse_tool_calls, strip_tool_call_protocol
 
 
 TOOLS = [{
@@ -322,6 +323,116 @@ class AgentCompatTests(unittest.TestCase):
             with closing(sqlite3.connect(db_path)) as con:
                 ids = [row[0] for row in con.execute("SELECT id FROM responses ORDER BY updated_at").fetchall()]
             self.assertEqual(ids, ["resp_new"])
+
+    def test_parse_tool_calls_suppresses_prose_around_call(self):
+        text = (
+            "I will update the file now.\n\n"
+            "```tool_call\n"
+            '{"name":"shell_command","arguments":{"command":"echo hi"}}\n'
+            "```\n"
+        )
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(clean, "")
+        self.assertEqual(calls[0]["function"]["name"], "shell_command")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["command"], "echo hi")
+
+    def test_parse_tool_calls_extracts_embedded_raw_json(self):
+        text = 'Use the terminal: {"name":"shell_command","arguments":{"command":"pwd; ls"}}'
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(clean, "")
+        self.assertEqual(calls[0]["function"]["name"], "shell_command")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["command"], "pwd; ls")
+
+    def test_strip_tool_call_protocol_removes_truncated_tail(self):
+        text = 'Done with the files.\n```tool_call\n{"name":"shell_command","arguments":{"command":'
+        cleaned = strip_tool_call_protocol(text)
+        self.assertEqual(cleaned, "Done with the files.")
+        self.assertNotIn("tool_call", cleaned)
+        self.assertNotIn("shell_command", cleaned)
+
+    def test_parse_tool_calls_hides_truncated_raw_json_tool_call(self):
+        text = 'Done.\n{"name":"shell_command","arguments":{"command":"unterminated'
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(clean, "Done.")
+        self.assertEqual(calls, [])
+        self.assertNotIn("shell_command", strip_tool_call_protocol(text))
+
+    def test_responses_parses_prose_plus_tool_call_without_leaking_text(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                (
+                    "I will modify the project now.\n"
+                    "```tool_call\n"
+                    '{"name":"shell_command","arguments":{"command":"echo hi"}}\n'
+                    "```"
+                ),
+            ])
+            try:
+                response = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "modify the project",
+                    "tools": TOOLS,
+                })
+                self.assertEqual(len(response["output"]), 1)
+                self.assertEqual(response["output"][0]["type"], "function_call")
+                self.assertEqual(response["output"][0]["name"], "shell_command")
+                self.assertNotIn("I will modify", json.dumps(response, ensure_ascii=False))
+                self.assertEqual(len(harness.prompts), 1)
+            finally:
+                harness.close()
+
+    def test_chat_completions_parses_prose_plus_tool_call_for_copilot(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                (
+                    "I will inspect the workspace.\n"
+                    "```tool_call\n"
+                    '{"name":"shell_command","arguments":{"command":"pwd; ls"}}\n'
+                    "```"
+                ),
+            ])
+            try:
+                response = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": TOOLS,
+                })
+                message = response["choices"][0]["message"]
+                self.assertIsNone(message["content"])
+                self.assertEqual(message["tool_calls"][0]["function"]["name"], "shell_command")
+                self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+                self.assertNotIn("I will inspect", json.dumps(response, ensure_ascii=False))
+                self.assertEqual(len(harness.prompts), 1)
+            finally:
+                harness.close()
+
+    def test_anthropic_parses_prose_plus_tool_call_for_claude_code(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                (
+                    "I will inspect the workspace.\n"
+                    "```tool_call\n"
+                    '{"name":"shell_command","arguments":{"command":"pwd; ls"}}\n'
+                    "```"
+                ),
+            ])
+            try:
+                response = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                })
+                self.assertEqual(response["content"][0]["type"], "tool_use")
+                self.assertEqual(response["content"][0]["name"], "shell_command")
+                self.assertEqual(response["stop_reason"], "tool_use")
+                self.assertNotIn("I will inspect", json.dumps(response, ensure_ascii=False))
+                self.assertEqual(len(harness.prompts), 1)
+            finally:
+                harness.close()
 
     def test_responses_retries_when_model_describes_tool_action(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:

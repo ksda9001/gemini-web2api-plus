@@ -226,6 +226,138 @@ def _normalize_tool_call_payload(payload) -> list:
     return tool_calls
 
 
+def _decode_json_values(text: str) -> list:
+    values = []
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            break
+        values.append(value)
+        index = end
+    return values
+
+
+def _tool_calls_from_json_text(payload_text: str) -> list:
+    payload_text = (payload_text or "").strip()
+    if not payload_text:
+        return []
+    try:
+        values = [json.loads(payload_text)]
+    except json.JSONDecodeError:
+        values = _decode_json_values(payload_text)
+
+    tool_calls = []
+    for value in values:
+        tool_calls.extend(_normalize_tool_call_payload(value))
+    return tool_calls
+
+
+def _find_tool_json_spans(text: str) -> list:
+    spans = []
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        tool_calls = _normalize_tool_call_payload(value)
+        if tool_calls:
+            spans.append((index, end, tool_calls))
+            index = end
+        else:
+            index += 1
+    return spans
+
+
+def _remove_spans(text: str, spans: list) -> str:
+    if not spans:
+        return text
+    parts = []
+    last_end = 0
+    for start, end in sorted((max(0, s), min(len(text), e)) for s, e in spans if e > s):
+        if start < last_end:
+            last_end = max(last_end, end)
+            continue
+        parts.append(text[last_end:start])
+        last_end = end
+    parts.append(text[last_end:])
+    return "".join(parts)
+
+
+def _strip_truncated_raw_tool_json(text: str) -> str:
+    for match in re.finditer(r"(?ms)(?:^|\n)[ \t]*(?=[{\[])", text):
+        tail = text[match.start():]
+        head = tail[:2000]
+        looks_like_tool = (
+            re.search(r'"tool_calls"\s*:', head)
+            or (
+                re.search(r'"(?:name|tool|tool_name)"\s*:', head)
+                and re.search(r'"(?:arguments|args|input)"\s*:', head)
+            )
+            or (
+                re.search(r'"function"\s*:\s*\{', head)
+                and re.search(r'"name"\s*:', head)
+            )
+        )
+        if looks_like_tool:
+            return text[:match.start()].strip()
+    return text
+
+
+_TOOL_PROTOCOL_FENCE_RE = re.compile(
+    r"```(?P<label>tool_call|function_call|json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_tool_call_protocol(text: str) -> str:
+    """Remove tool-call protocol fragments from text that may be shown to users."""
+    if not text:
+        return text or ""
+
+    spans = []
+    for match in _TOOL_PROTOCOL_FENCE_RE.finditer(text):
+        label = (match.group("label") or "").lower()
+        calls = _tool_calls_from_json_text(match.group("body"))
+        if label in ("tool_call", "function_call") or calls:
+            spans.append((match.start(), match.end()))
+    cleaned = _remove_spans(text, spans)
+
+    # Hide a truncated protocol tail; retry/fallback can recover a structured call.
+    cleaned = re.sub(
+        r"(?is)```(?:tool_call|function_call)[ \t]*(?:\r?\n|$).*",
+        "",
+        cleaned,
+    )
+
+    prefix_spans = []
+    for match in re.finditer(r"(?im)(?:^|\n)[ \t]*(?:tool_call|function_call)[ \t]*\r?\n", cleaned):
+        tail = cleaned[match.end():]
+        stripped_tail = tail.lstrip()
+        leading = len(tail) - len(stripped_tail)
+        raw_spans = _find_tool_json_spans(stripped_tail)
+        if raw_spans and raw_spans[0][0] == 0:
+            prefix_spans.append((match.start(), match.end() + leading + raw_spans[0][1]))
+    cleaned = _remove_spans(cleaned, prefix_spans)
+
+    raw_json_spans = [(start, end) for start, end, _ in _find_tool_json_spans(cleaned)]
+    cleaned = _remove_spans(cleaned, raw_json_spans)
+    cleaned = _strip_truncated_raw_tool_json(cleaned)
+    return cleaned.strip()
+
+
 def _json_from_single_fence(text: str) -> str:
     stripped = text.strip()
     match = re.fullmatch(r'```(?:json|tool_call|function_call)?\s*\n(.*?)\n```', stripped, re.DOTALL)
@@ -234,29 +366,29 @@ def _json_from_single_fence(text: str) -> str:
 
 def parse_tool_calls(text: str) -> tuple:
     """Extract tool_call blocks or raw JSON calls. Returns (clean_text, tool_calls_list)."""
+    text = text or ""
     tool_calls = []
-    pattern = r'```(?:tool_call|function_call)\s*\n(.*?)\n```'
-    clean_parts = []
-    last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
-        clean_parts.append(text[last_end:m.start()])
-        last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.extend(_normalize_tool_call_payload(data))
-        except json.JSONDecodeError:
-            pass
-    clean_parts.append(text[last_end:])
-    clean = "".join(clean_parts).strip()
-    if not tool_calls and clean:
-        try:
-            data = json.loads(_json_from_single_fence(clean))
-            raw_tool_calls = _normalize_tool_call_payload(data)
-            if raw_tool_calls:
-                return "", raw_tool_calls
-        except json.JSONDecodeError:
-            pass
-    return clean, tool_calls
+    protocol_spans = []
+    for match in _TOOL_PROTOCOL_FENCE_RE.finditer(text):
+        label = (match.group("label") or "").lower()
+        block_calls = _tool_calls_from_json_text(match.group("body"))
+        if label in ("tool_call", "function_call") or block_calls:
+            protocol_spans.append((match.start(), match.end()))
+        tool_calls.extend(block_calls)
+
+    if not tool_calls:
+        clean = _remove_spans(text, protocol_spans).strip()
+        raw_text = _json_from_single_fence(clean)
+        tool_calls.extend(_tool_calls_from_json_text(raw_text))
+
+    if not tool_calls:
+        clean = _remove_spans(text, protocol_spans)
+        for _, _, raw_calls in _find_tool_json_spans(clean):
+            tool_calls.extend(raw_calls)
+
+    if tool_calls:
+        return "", tool_calls
+    return strip_tool_call_protocol(text), tool_calls
 
 
 # ─── Google Native API helpers ─────────────────────────────────────────────────
@@ -361,24 +493,6 @@ def google_contents_to_prompt(req: dict) -> tuple:
             parts.append(text)
 
     return "\n\n".join(p for p in parts if p), images
-
-
-def _decode_json_values(text: str) -> list:
-    values = []
-    decoder = json.JSONDecoder()
-    index = 0
-    while index < len(text):
-        while index < len(text) and text[index].isspace():
-            index += 1
-        if index >= len(text):
-            break
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
-            break
-        values.append(value)
-        index = end
-    return values
 
 
 def _google_call_from_payload(payload) -> list:
