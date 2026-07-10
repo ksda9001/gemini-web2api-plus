@@ -112,6 +112,12 @@ Agent 兼容能力包括:
 - 对超长工具输出和旧历史做确定性截断/压缩
 - 在 prompt 上下文中保留 Anthropic `thinking` / `redacted_thinking` 信息
 
+### 聊天与 Agent 工具调用
+
+Google 原生流式接口 (`/v1beta/models/{model}:streamGenerateContent`) 默认将 `google_stream_auto_tools` 设为 `false`. Open WebUI/NewAPI 这类聊天集成有时会在普通聊天里也发送 `tools` 和 `functionCallingConfig.mode=AUTO`. 如果把这些工具 schema 注入 Gemini Web prompt, prompt 会明显膨胀, 容易触发空回复或截断, 所以默认会把这个特定的 stream AUTO 场景当作普通流式聊天处理.
+
+这不会关闭 agent 能力. Codex 走 `/v1/responses`, Claude Code 走 `/v1/messages`, Copilot/OpenAI 兼容 agent 走 `/v1/chat/completions`; 这些端点仍保留工具调用、修复重试、SQLite 的 `previous_response_id` 状态和多步执行能力. 非流式 Google 原生 `generateContent` 也保留 function calling. 只有在你明确需要 Google 原生流式 AUTO 工具调用, 并且能接受更高的 prompt 膨胀/截断风险时, 才建议把 `google_stream_auto_tools` 改成 `true`.
+
 ## 可用模型
 
 | 模型 | 说明 | 输出量 |
@@ -208,6 +214,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "max_tool_output_chars": 12000,
   "max_history_messages": 40,
   "max_history_chars": 60000,
+  "max_google_prompt_chars": 18000,
+  "google_stream_auto_tools": false,
   "tool_retry_attempts": 1
 }
 ```
@@ -219,6 +227,8 @@ Agent 相关配置:
 - `response_store_ttl_sec`: 历史保留时间
 - `max_tool_output_chars`: shell/tool 输出进入上下文前的首尾截断长度
 - `max_history_messages` / `max_history_chars`: 历史上下文压缩上限
+- `max_google_prompt_chars`: Google 原生接口发往上游的 prompt 字符上限；超长时优先裁掉更早的上下文, 降低空回复/截断概率
+- `google_stream_auto_tools`: 保持 `false` 可优先保证 Open WebUI/NewAPI 这类流式聊天稳定；只有需要 Google 原生流式 AUTO 工具调用时才设为 `true`
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 
 ## Docker 部署

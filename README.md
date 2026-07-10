@@ -122,6 +122,12 @@ Agent compatibility includes:
 - deterministic truncation/compaction of long tool outputs and old history
 - Anthropic `thinking` / `redacted_thinking` preservation in prompt context
 
+### Chat vs Agent Tool Use
+
+Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`) default `google_stream_auto_tools` to `false`. Many chat UIs, including Open WebUI/NewAPI-style integrations, may send `tools` plus `functionCallingConfig.mode=AUTO` even for ordinary chat. Injecting those tool schemas into the Gemini Web prompt can make the prompt very large and cause empty or truncated replies, so the default treats that specific stream AUTO case as plain streaming chat.
+
+This does not disable agent clients. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; those endpoints keep tool calling, repair retries, SQLite-backed `previous_response_id` state, and multi-step execution. Non-streaming Google native `generateContent` also keeps function calling. Set `google_stream_auto_tools` to `true` only if you intentionally need Google native streaming AUTO function calling and accept the higher prompt-bloat/truncation risk.
+
 ## Available Models
 
 | Model | Description | Output |
@@ -218,6 +224,8 @@ Create `config.json` in the same directory:
   "max_tool_output_chars": 12000,
   "max_history_messages": 40,
   "max_history_chars": 60000,
+  "max_google_prompt_chars": 18000,
+  "google_stream_auto_tools": false,
   "tool_retry_attempts": 1
 }
 ```
@@ -229,6 +237,8 @@ Agent-related config:
 - `response_store_ttl_sec`: history retention window
 - `max_tool_output_chars`: head/tail truncation limit for shell/tool outputs stored in context
 - `max_history_messages` / `max_history_chars`: deterministic context compaction limits
+- `max_google_prompt_chars`: hard cap for Google native prompt text sent upstream; older context is trimmed first to reduce empty/truncated responses
+- `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 ## Docker
