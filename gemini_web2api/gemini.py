@@ -179,14 +179,31 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+def _merge_text_segments(texts: list) -> str:
+    """Merge Gemini text segments that may be cumulative or independent chunks."""
+    merged = ""
+    for text in texts or []:
+        if not isinstance(text, str) or not text:
+            continue
+        if not merged:
+            merged = text
+        elif text == merged:
+            continue
+        elif text.startswith(merged):
+            merged = text
+        elif merged.endswith(text):
+            continue
+        else:
+            merged += text
+    return merged
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    last_text = ""
+    texts = []
     for line in raw.split("\n"):
-        for t in _extract_texts_from_line(line):
-            if len(t) > len(last_text):
-                last_text = t
-    return clean_text(last_text)
+        texts.extend(_extract_texts_from_line(line))
+    return clean_text(_merge_text_segments(texts))
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
@@ -235,7 +252,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            prev_text = ""
+            emitted_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 buf = ""
                 for chunk in resp.iter_text():
@@ -243,11 +260,13 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
-                            if len(t) > len(prev_text):
-                                delta = clean_text(t[len(prev_text):])
-                                if delta:
-                                    yield delta
-                                prev_text = t
+                            next_text = _merge_text_segments([emitted_text, t])
+                            if len(next_text) <= len(emitted_text):
+                                continue
+                            delta = clean_text(next_text[len(emitted_text):])
+                            if delta:
+                                yield delta
+                            emitted_text = next_text
             return
         except Exception as e:
             last_err = e

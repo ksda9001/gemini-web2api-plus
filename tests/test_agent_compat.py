@@ -10,6 +10,7 @@ import urllib.request
 from contextlib import closing
 from pathlib import Path
 
+from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
 from gemini_web2api.agent import ResponseStore
 from gemini_web2api.config import CONFIG
@@ -34,6 +35,14 @@ GOOGLE_TOOLS = [{
         "parameters": TOOLS[0]["parameters"],
     }],
 }]
+
+
+def make_wrb_line(*texts):
+    inner = [None] * 5
+    inner[0] = "x" * 220
+    inner[4] = [[None, list(texts)]]
+    outer = [["wrb.fr", None, json.dumps(inner, ensure_ascii=False)]]
+    return json.dumps(outer, ensure_ascii=False)
 
 
 def load_single_file_module():
@@ -162,6 +171,31 @@ class SingleFileHttpHarness:
 
 
 class AgentCompatTests(unittest.TestCase):
+    def test_extract_response_text_merges_independent_segments(self):
+        raw = "\n".join([
+            make_wrb_line("第一段。\n"),
+            make_wrb_line("第二段。\n"),
+            make_wrb_line("第三段。"),
+        ])
+        self.assertEqual(extract_response_text(raw), "第一段。\n第二段。\n第三段。")
+
+    def test_extract_response_text_uses_cumulative_segments_without_duplication(self):
+        raw = "\n".join([
+            make_wrb_line("第一段。"),
+            make_wrb_line("第一段。\n第二段。"),
+            make_wrb_line("第一段。\n第二段。\n第三段。"),
+        ])
+        self.assertEqual(extract_response_text(raw), "第一段。\n第二段。\n第三段。")
+
+    def test_single_file_extract_response_text_merges_segments(self):
+        module = load_single_file_module()
+        raw = "\n".join([
+            make_wrb_line("Part A. "),
+            make_wrb_line("Part B. "),
+            make_wrb_line("Part C."),
+        ])
+        self.assertEqual(module.extract_response_text(raw), "Part A. Part B. Part C.")
+
     def test_single_file_entry_supports_codex_responses_tools(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = SingleFileHttpHarness(tmpdir, [

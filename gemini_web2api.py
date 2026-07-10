@@ -293,7 +293,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
             yield text
         return
 
-    prev_text = ""
+    emitted_text = ""
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -319,12 +319,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                             for part in inner2[4]:
                                 if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                     for t in part[1]:
-                                        if isinstance(t, str) and len(t) > len(prev_text):
-                                            delta = t[len(prev_text):]
-                                            delta = clean_gemini_text(delta)
-                                            if delta:
-                                                yield delta
-                                            prev_text = t
+                                        if not isinstance(t, str):
+                                            continue
+                                        next_text = _merge_text_segments([emitted_text, t])
+                                        if len(next_text) <= len(emitted_text):
+                                            continue
+                                        delta = clean_gemini_text(next_text[len(emitted_text):])
+                                        if delta:
+                                            yield delta
+                                        emitted_text = next_text
                     except (json.JSONDecodeError, IndexError, TypeError):
                         pass
 
@@ -336,6 +339,25 @@ def clean_gemini_text(text: str) -> str:
         '', text, flags=re.DOTALL
     )
     return text.strip()
+
+
+def _merge_text_segments(texts: list) -> str:
+    """Merge Gemini text segments that may be cumulative or independent chunks."""
+    merged = ""
+    for text in texts or []:
+        if not isinstance(text, str) or not text:
+            continue
+        if not merged:
+            merged = text
+        elif text == merged:
+            continue
+        elif text.startswith(merged):
+            merged = text
+        elif merged.endswith(text):
+            continue
+        else:
+            merged += text
+    return merged
 
 
 def extract_response_text(raw: str) -> str:
@@ -363,12 +385,7 @@ def extract_response_text(raw: str) -> str:
                                     texts.append(t)
         except (json.JSONDecodeError, IndexError, TypeError):
             pass
-    text = ""
-    for t in reversed(texts):
-        if t.strip():
-            text = t
-            break
-    return clean_gemini_text(text)
+    return clean_gemini_text(_merge_text_segments(texts))
 
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
