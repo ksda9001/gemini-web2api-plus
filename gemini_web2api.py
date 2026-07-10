@@ -674,11 +674,28 @@ def _any_user_action_text(messages: list) -> str:
     return ""
 
 
+def _latest_non_system_role(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") != "system":
+            return msg.get("role", "")
+    return ""
+
+
+def _sanitize_model_text(text: str) -> str:
+    if not text:
+        return text or ""
+    cleaned = re.sub(r"(?ms)^\s*\[Tool result for [^\]]+\]:.*?(?:\n\s*\n|\Z)", "", text)
+    cleaned = re.sub(r"(?m)^\s*\[Assistant\]:\s*", "", cleaned)
+    return cleaned.strip()
+
+
 def _should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_calls) -> bool:
     if not tools or tool_choice == "none" or tool_calls:
         return False
     if tool_choice == "required" or isinstance(tool_choice, dict):
         return True
+    if _latest_non_system_role(messages) == "tool":
+        return False
     user_text = _any_user_action_text(messages) or _latest_user_text(messages)
     if user_text and ACTION_RE.search(user_text):
         return True
@@ -1036,11 +1053,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        text = _sanitize_model_text(text)
         if _should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
                 if retry_calls:
-                    text, tool_calls = retry_text, retry_calls
+                    text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
         if not tool_calls:
             tool_calls = _fallback_tool_call(chat_messages, tools, tool_choice)
@@ -1315,11 +1333,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        text = _sanitize_model_text(text)
         if _should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
                 if retry_calls:
-                    text, tool_calls = retry_text, retry_calls
+                    text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
         if not tool_calls:
             tool_calls = _fallback_tool_call(messages, tools, tool_choice)
@@ -1510,11 +1529,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
             return
+        text = _sanitize_model_text(text)
         if _should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
                 if retry_calls:
-                    text, tool_calls = retry_text, retry_calls
+                    text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
         if not tool_calls:
             tool_calls = _fallback_tool_call(anthropic_messages, tools, tool_choice)

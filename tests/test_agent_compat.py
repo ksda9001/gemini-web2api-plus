@@ -606,6 +606,64 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 harness.close()
 
+    def test_responses_allows_final_text_after_tool_output(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"shell_command","arguments":{"command":"pwd; ls"}}',
+                "Done. I updated the files and verified the output.",
+            ])
+            try:
+                first = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "inspect and fix the project",
+                    "tools": TOOLS,
+                })
+                second = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "previous_response_id": first["id"],
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": first["output"][0]["call_id"],
+                        "output": "file list",
+                    }],
+                    "tools": TOOLS,
+                })
+                self.assertEqual(second["output"][0]["type"], "message")
+                self.assertIn("updated the files", second["output"][0]["content"][0]["text"])
+                self.assertEqual(len(harness.prompts), 2)
+            finally:
+                harness.close()
+
+    def test_responses_strips_echoed_tool_result_from_final_text(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"shell_command","arguments":{"command":"pwd; ls"}}',
+                "[Tool result for call_abc]: Exit code: 0\nWall time: 1.2 seconds\nOutput:\nsecret output\n\nAll done. Files were updated.",
+            ])
+            try:
+                first = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "inspect and fix the project",
+                    "tools": TOOLS,
+                })
+                second = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "previous_response_id": first["id"],
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": first["output"][0]["call_id"],
+                        "output": "secret output",
+                    }],
+                    "tools": TOOLS,
+                })
+                text = second["output"][0]["content"][0]["text"]
+                self.assertEqual(second["output"][0]["type"], "message")
+                self.assertNotIn("[Tool result", text)
+                self.assertNotIn("secret output", text)
+                self.assertIn("All done", text)
+            finally:
+                harness.close()
+
     def test_anthropic_retries_text_into_tool_use_for_claude_code(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [

@@ -74,6 +74,22 @@ def any_user_action_text(messages: list) -> str:
     return ""
 
 
+def latest_non_system_role(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") != "system":
+            return msg.get("role", "")
+    return ""
+
+
+def sanitize_model_text(text: str) -> str:
+    """Remove protocol fragments that Gemini may echo from tool-result prompts."""
+    if not text:
+        return text or ""
+    cleaned = re.sub(r"(?ms)^\s*\[Tool result for [^\]]+\]:.*?(?:\n\s*\n|\Z)", "", text)
+    cleaned = re.sub(r"(?m)^\s*\[Assistant\]:\s*", "", cleaned)
+    return cleaned.strip()
+
+
 def truncate_text(text, max_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS) -> str:
     if text is None:
         return ""
@@ -153,6 +169,8 @@ def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_c
         return True
     if isinstance(tool_choice, dict):
         return True
+    if latest_non_system_role(messages) == "tool":
+        return False
     user_text = any_user_action_text(messages) or latest_user_text(messages)
     if not user_text or not ACTION_RE.search(user_text):
         return bool(text and ACTION_RE.search(text))

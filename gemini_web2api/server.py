@@ -30,6 +30,7 @@ from .agent import (
     response_call_to_tool_call,
     response_content_to_message_parts,
     response_messages_from_output,
+    sanitize_model_text,
     should_retry_tool_call,
     truncate_tool_output,
 )
@@ -235,6 +236,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         if should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
@@ -473,6 +475,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
@@ -672,6 +675,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
@@ -780,6 +784,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if not text:
             log("Warning: empty response from Gemini")
+        text = sanitize_model_text(text)
 
         response_parts = []
         function_calls = []
