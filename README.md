@@ -241,6 +241,7 @@ Create `config.json` in the same directory:
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,
   "webapi_watchdog_sec": 120,
+  "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1
 }
 ```
@@ -262,6 +263,7 @@ Agent-related config:
 - `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: rotate and persist `__Secure-1PSIDTS` in the background
 - `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
+- `webapi_request_timeout_sec`: total wait for non-stream requests and idle wait between streaming deltas; expiration cancels the background task and allows the configured direct fallback
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.

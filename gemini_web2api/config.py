@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "cookie_auto_refresh": True,
     "cookie_refresh_interval_sec": 600,
     "webapi_watchdog_sec": 120,
+    "webapi_request_timeout_sec": 180,
     "tool_retry_attempts": 1,
 }
 

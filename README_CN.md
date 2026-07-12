@@ -231,6 +231,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,
   "webapi_watchdog_sec": 120,
+  "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1
 }
 ```
@@ -252,6 +253,7 @@ Agent 相关配置:
 - `cookie_cache_path`: 自动轮换后的 Google Cookie 私有缓存目录；必须放在持久化 volume 中，不能提交 Git
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: 后台轮换 `__Secure-1PSIDTS` 并保存，避免长期运行后认证过期
 - `webapi_watchdog_sec`: Gemini 流长时间无数据时判定停滞并恢复的阈值
+- `webapi_request_timeout_sec`: 新上游非流式请求的总等待上限，以及流式请求相邻输出之间的闲置上限；超时会取消后台任务并按配置回退 direct
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。

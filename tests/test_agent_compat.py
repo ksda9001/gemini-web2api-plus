@@ -333,6 +333,46 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 CONFIG["cookie_file"] = previous
 
+    def test_webapi_non_stream_timeout_cancels_background_future(self):
+        class TimedOutFuture:
+            def __init__(self):
+                self.cancelled = False
+
+            def result(self, timeout):
+                raise webapi_backend.FutureTimeoutError()
+
+            def cancel(self):
+                self.cancelled = True
+
+        backend = object.__new__(webapi_backend.GeminiWebAPIBackend)
+        future = TimedOutFuture()
+        def fake_submit(coroutine):
+            coroutine.close()
+            return future
+        backend._submit = fake_submit
+        previous = CONFIG.get("webapi_request_timeout_sec")
+        CONFIG["webapi_request_timeout_sec"] = 1
+        try:
+            with self.assertRaisesRegex(TimeoutError, "exceeded 1s"):
+                backend.generate("hello", "gemini-3.5-flash")
+        finally:
+            CONFIG["webapi_request_timeout_sec"] = previous
+        self.assertTrue(future.cancelled)
+
+    def test_webapi_stream_idle_timeout_cancels_background_future(self):
+        class PendingFuture:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        stream = webapi_backend.SyncWebAPIStream(0.01)
+        stream._future = PendingFuture()
+        with self.assertRaisesRegex(TimeoutError, "idle"):
+            next(stream)
+        self.assertTrue(stream._future.cancelled)
+
     def test_generate_with_state_uses_webapi_session_backend(self):
         previous = {
             key: CONFIG.get(key)

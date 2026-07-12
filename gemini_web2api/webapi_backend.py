@@ -5,7 +5,7 @@ import json
 import os
 import queue
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 
 from .config import CONFIG
 
@@ -26,6 +26,19 @@ MODEL_ALIASES = {
     "gemini-3.5-flash-thinking-lite": "gemini-3-flash-thinking",
     "gemini-flash-lite": "gemini-3-flash",
 }
+
+
+def _request_timeout() -> int:
+    return max(
+        1,
+        int(
+            CONFIG.get(
+                "webapi_request_timeout_sec",
+                CONFIG.get("request_timeout_sec", 180),
+            )
+            or 180
+        ),
+    )
 
 
 def _cookie_pairs() -> dict:
@@ -182,25 +195,37 @@ class GeminiWebAPIBackend:
             result._queue.put(("error", exc))
 
     def generate(self, prompt: str, model_name: str, state: dict = None) -> tuple:
-        timeout = int(CONFIG.get("request_timeout_sec", 180) or 180) + 30
-        return self._submit(self._generate(prompt, model_name, state)).result(timeout=timeout)
+        timeout = _request_timeout()
+        future = self._submit(self._generate(prompt, model_name, state))
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            raise TimeoutError(f"Gemini webapi request exceeded {timeout}s")
 
     def generate_stream(self, prompt: str, model_name: str, state: dict = None):
-        result = SyncWebAPIStream()
-        self._submit(self._stream(result, prompt, model_name, state))
+        result = SyncWebAPIStream(_request_timeout())
+        result._future = self._submit(self._stream(result, prompt, model_name, state))
         return result
 
 
 class SyncWebAPIStream:
-    def __init__(self):
+    def __init__(self, timeout: int):
         self._queue = queue.Queue()
+        self._future = None
+        self._timeout = timeout
         self.state = None
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        kind, value = self._queue.get()
+        try:
+            kind, value = self._queue.get(timeout=self._timeout)
+        except queue.Empty:
+            if self._future:
+                self._future.cancel()
+            raise TimeoutError(f"Gemini webapi stream was idle for {self._timeout}s")
         if kind == "delta":
             return value
         if kind == "error":
