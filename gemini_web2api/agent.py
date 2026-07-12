@@ -1,5 +1,6 @@
 """Agent compatibility helpers for tool-using clients."""
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -35,6 +36,16 @@ ACTION_RE = re.compile(
 
 def json_clone(value):
     return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def conversation_hash(model: str, messages: list) -> str:
+    payload = json.dumps(
+        {"model": model or "", "messages": messages or []},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def tool_call_ids(messages: list) -> list:
@@ -390,6 +401,21 @@ class ResponseStore:
                     """
                 )
                 con.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated ON agent_sessions(updated_at)")
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_sessions (
+                        history_hash TEXT PRIMARY KEY,
+                        updated_at INTEGER NOT NULL,
+                        model TEXT NOT NULL,
+                        upstream_json TEXT NOT NULL,
+                        messages_json TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_conversation_sessions_updated "
+                    "ON conversation_sessions(updated_at)"
+                )
             self._ready = True
 
     def _prune(self, con):
@@ -398,6 +424,7 @@ class ResponseStore:
             con.execute("DELETE FROM responses WHERE updated_at < ?", (now - self.ttl_sec,))
             con.execute("DELETE FROM upstream_sessions WHERE updated_at < ?", (now - self.ttl_sec,))
             con.execute("DELETE FROM agent_sessions WHERE updated_at < ?", (now - self.ttl_sec,))
+            con.execute("DELETE FROM conversation_sessions WHERE updated_at < ?", (now - self.ttl_sec,))
         if self.max_rows > 0:
             con.execute(
                 """
@@ -425,6 +452,15 @@ class ResponseStore:
                 )
                 """,
                 (self.max_rows * 4,),
+            )
+            con.execute(
+                """
+                DELETE FROM conversation_sessions
+                WHERE history_hash NOT IN (
+                    SELECT history_hash FROM conversation_sessions ORDER BY updated_at DESC LIMIT ?
+                )
+                """,
+                (self.max_rows * 2,),
             )
 
     def save(self, response: dict, messages: list, output: list, previous_response_id: str = None):
@@ -546,6 +582,66 @@ class ResponseStore:
             "known_messages": known_messages,
             "delta_messages": delta,
         }
+
+    def save_conversation_session(self, model: str, upstream_state: dict, messages: list):
+        if not upstream_state or not messages:
+            return
+        known_messages = compact_messages(
+            messages,
+            self.max_history_messages,
+            self.max_history_chars,
+            self.max_tool_output_chars,
+        )
+        key = conversation_hash(model, known_messages)
+        self._init()
+        now = int(time.time())
+        with self._lock:
+            with self._connection() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO conversation_sessions "
+                    "(history_hash, updated_at, model, upstream_json, messages_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        key,
+                        now,
+                        model or "",
+                        json.dumps(upstream_state, ensure_ascii=False),
+                        json.dumps(known_messages, ensure_ascii=False),
+                    ),
+                )
+                self._prune(con)
+
+    def find_conversation_session(self, model: str, messages: list) -> dict:
+        messages = list(messages or [])
+        if len(messages) < 2:
+            return {}
+        self._init()
+        for prefix_len in range(len(messages) - 1, 0, -1):
+            prefix = compact_messages(
+                messages[:prefix_len],
+                self.max_history_messages,
+                self.max_history_chars,
+                self.max_tool_output_chars,
+            )
+            key = conversation_hash(model, prefix)
+            with self._lock:
+                with self._connection() as con:
+                    row = con.execute(
+                        "SELECT upstream_json, messages_json FROM conversation_sessions "
+                        "WHERE history_hash = ? AND model = ?",
+                        (key, model or ""),
+                    ).fetchone()
+            if not row:
+                continue
+            known_messages = json.loads(row[1])
+            delta = incremental_messages(messages, known_messages)
+            if delta:
+                return {
+                    "upstream_state": json.loads(row[0]),
+                    "known_messages": known_messages,
+                    "delta_messages": delta,
+                }
+        return {}
 
 
 def response_call_to_tool_call(item: dict, fallback_index: int = 0) -> dict:

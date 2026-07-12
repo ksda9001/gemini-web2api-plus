@@ -27,6 +27,12 @@ DEFAULT_CONFIG = {
     "continuation_attempts": 2,
     "sse_heartbeat_sec": 10,
     "reuse_upstream_sessions": False,
+    "upstream_session_backend": "gemini_webapi",
+    "upstream_session_fallback_direct": True,
+    "cookie_cache_path": "/app/data/gemini_cookies",
+    "cookie_auto_refresh": True,
+    "cookie_refresh_interval_sec": 600,
+    "webapi_watchdog_sec": 120,
     "tool_retry_attempts": 1,
 }
 

@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -17,6 +18,7 @@ import gemini_web2api.server as server
 from gemini_web2api.agent import ResponseStore, filter_tool_calls
 from gemini_web2api.config import CONFIG
 from gemini_web2api.tools import messages_to_prompt, parse_tool_calls, strip_tool_call_protocol
+from gemini_web2api.webapi_backend import metadata_to_state, state_to_metadata
 
 
 TOOLS = [{
@@ -274,6 +276,92 @@ class AgentCompatTests(unittest.TestCase):
         self.assertEqual(extract_response_text(raw), "partial code")
         self.assertTrue(gemini._was_truncated(raw))
 
+    def test_direct_protocol_preserves_complete_conversation_metadata(self):
+        metadata = ["c1", "r1", "old-choice", "m3", None, "m5", None, None, None, "ctx-token"]
+        inner = [None] * 28
+        inner[1] = metadata
+        inner[4] = [["new-choice", ["answer"]]]
+        inner[25] = "ctx-token-new"
+        raw = json.dumps([["wrb.fr", None, json.dumps(inner)]])
+
+        state = gemini._extract_conversation_state(raw)
+        self.assertEqual(state["backend"], "direct")
+        self.assertEqual(state["metadata"][0:3], ["c1", "r1", "new-choice"])
+        self.assertEqual(state["metadata"][3], "m3")
+        self.assertEqual(state["metadata"][9], "ctx-token-new")
+
+        payload = urllib.parse.parse_qs(gemini._build_payload("continue", 1, 0, conversation=state))
+        outer = json.loads(payload["f.req"][0])
+        rebuilt = json.loads(outer[1])
+        self.assertEqual(rebuilt[2], state["metadata"])
+
+    def test_webapi_metadata_round_trip_keeps_context(self):
+        metadata = ["c1", "r2", "rc3", None, None, None, None, None, None, "context"]
+        state = metadata_to_state(metadata)
+        self.assertEqual(state["backend"], "gemini_webapi")
+        self.assertEqual(state_to_metadata(state), metadata)
+
+    def test_generate_with_state_uses_webapi_session_backend(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in ("reuse_upstream_sessions", "upstream_session_backend")
+        }
+        CONFIG.update({"reuse_upstream_sessions": True, "upstream_session_backend": "gemini_webapi"})
+        state = metadata_to_state(["c1", "r1", "rc1", None, None, None, None, None, None, "ctx"])
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                return_value=("continued", state),
+            ) as webapi_generate:
+                text, returned_state, usage_prompt = gemini.generate_with_state(
+                    "new tool result", 1, 0, conversation=state, model_name="gemini-3.5-flash"
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "continued")
+        self.assertEqual(returned_state, state)
+        self.assertEqual(usage_prompt, "new tool result")
+        webapi_generate.assert_called_once_with("new tool result", "gemini-3.5-flash", state)
+
+    def test_webapi_failure_replays_full_prompt_through_direct_backend(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "reuse_upstream_sessions",
+                "upstream_session_backend",
+                "upstream_session_fallback_direct",
+                "retry_attempts",
+            )
+        }
+        CONFIG.update({
+            "reuse_upstream_sessions": True,
+            "upstream_session_backend": "gemini_webapi",
+            "upstream_session_fallback_direct": True,
+            "retry_attempts": 1,
+        })
+        state = metadata_to_state(["c1", "r1", "rc1", None, None, None, None, None, None, "ctx"])
+        direct_state = {"backend": "direct", "conversation_id": "c2", "response_id": "r2", "choice_id": "rc2"}
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                side_effect=RuntimeError("resume rejected"),
+            ), patch.object(
+                gemini,
+                "_request_text",
+                return_value=("rebuilt", False, direct_state),
+            ) as direct_request:
+                text, returned_state, usage_prompt = gemini.generate_with_state(
+                    "delta", 1, 0, conversation=state, fallback_prompt="full history",
+                    model_name="gemini-3.5-flash",
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "rebuilt")
+        self.assertEqual(returned_state, direct_state)
+        self.assertEqual(usage_prompt, "full history")
+        self.assertEqual(direct_request.call_args.args[0], "full history")
+        self.assertIsNone(direct_request.call_args.args[5])
+
     def test_generate_continues_truncated_output_without_duplicate_overlap(self):
         responses = iter([
             ("```html\n<body>mars", True, {"conversation_id": "c1", "response_id": "r1", "choice_id": "rc1"}),
@@ -429,6 +517,27 @@ class AgentCompatTests(unittest.TestCase):
             session = store.find_agent_session("gemini-3.5-flash", continued)
             self.assertEqual(session["upstream_state"], state)
             self.assertEqual(session["delta_messages"], [continued[-1]])
+
+    def test_response_store_reuses_plain_conversation_by_history_prefix(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            store = ResponseStore(str(Path(tmpdir) / "responses.db"))
+            state = metadata_to_state(
+                ["c1", "r1", "rc1", None, None, None, None, None, None, "ctx"]
+            )
+            known = [
+                {"role": "user", "content": "Remember code 7319."},
+                {"role": "assistant", "content": "I will remember it."},
+            ]
+            store.save_conversation_session("gemini-3.5-flash", state, known)
+            session = store.find_conversation_session(
+                "gemini-3.5-flash",
+                known + [{"role": "user", "content": "What was the code?"}],
+            )
+            self.assertEqual(session["upstream_state"], state)
+            self.assertEqual(
+                session["delta_messages"],
+                [{"role": "user", "content": "What was the code?"}],
+            )
 
     def test_response_store_links_previous_response_and_truncates_tool_output(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -844,6 +953,26 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(harness.prompts[1], "[Tool result for shell_command]: /workspace")
                 self.assertNotIn("Agent mode", harness.prompts[1])
                 self.assertNotIn("Available tools", harness.prompts[1])
+            finally:
+                harness.close()
+
+    def test_chat_completions_reuses_plain_upstream_session(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, ["I will remember 7319.", "The code was 7319."])
+            try:
+                first_messages = [{"role": "user", "content": "Remember code 7319."}]
+                first = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash", "messages": first_messages,
+                })
+                second = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": first_messages + [
+                        first["choices"][0]["message"],
+                        {"role": "user", "content": "What was the code?"},
+                    ],
+                })
+                self.assertEqual(second["choices"][0]["message"]["content"], "The code was 7319.")
+                self.assertEqual(harness.prompts[1], "What was the code?")
             finally:
                 harness.close()
 

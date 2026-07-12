@@ -120,7 +120,7 @@ Agent compatibility includes:
 - automatic tool-call repair retry when the model describes an action instead of calling a tool
 - rejection and repair of model-invented tool names that were not declared by the client
 - SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
-- experimental Gemini Web `conversation_id` / `response_id` / `choice_id` persistence for accounts that support upstream continuation
+- complete 10-field Gemini Web conversation metadata persisted for plain chat and agent requests
 - the full Agent behavior instruction only on the first tool turn, plus compact JSON tool schemas on stateless follow-up turns
 - deterministic truncation/compaction of long tool outputs and old history
 - Anthropic `thinking` / `redacted_thinking` preservation in prompt context
@@ -132,7 +132,7 @@ Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`
 
 Tool-free OpenAI, Responses, and Anthropic requests do not receive the Agent behavior instruction. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; requests that actually provide tools keep complete agent behavior. On an agent request, the full Agent behavior instruction is injected only before the first tool call. Follow-up requests whose history already contains a tool call/result omit that instruction.
 
-Clients normally include `tools` in every HTTP request as part of stateless Codex, Claude, and Copilot model protocols. The current Gemini Web account returns `BardErrorInfo 1096/1097` for upstream continuation on every configured model, so the model must still see the compact tool schema on every agent turn to produce reliable arguments. If `reuse_upstream_sessions` is enabled for an account that passes a real continuation test, follow-up turns send only new messages/tool results. SQLite preserves Responses history and links tool steps, but the connected agent client still executes each tool and drives the loop until the model returns a final answer.
+Clients normally include `tools` in every HTTP request as part of Codex, Claude, and Copilot model protocols. With `reuse_upstream_sessions` enabled, the server uses `gemini-webapi` for live page tokens, dynamic model headers, cookie rotation, and complete conversation metadata. SQLite restores sessions by message-history prefix or tool call ID, so follow-up turns send only new messages/tool results. If authentication or metadata continuation fails, the request automatically falls back to compressed full-history replay through the legacy direct backend. The connected agent client still executes each tool and drives the loop until the model returns a final answer.
 
 ## Available Models
 
@@ -167,16 +167,16 @@ python -m gemini_web2api --cookie-file cookie.txt
 
 1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
 2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
+3. Copy `__Secure-1PSID` and `__Secure-1PSIDTS` from the same browser session; a full export may also retain `SID`, `HSID`, `SSID`, `APISID`, and `SAPISID`
 4. Create `cookie.txt` in this format:
 
 ```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value
+SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value; __Secure-1PSIDTS=your_1psidts_value
 ```
 
 Or use the JSON format:
 ```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
+{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx; __Secure-1PSIDTS=xxx", "sapisid": "your_sapisid_value"}
 ```
 
 **Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
@@ -235,6 +235,12 @@ Create `config.json` in the same directory:
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
   "reuse_upstream_sessions": false,
+  "upstream_session_backend": "gemini_webapi",
+  "upstream_session_fallback_direct": true,
+  "cookie_cache_path": "/app/data/gemini_cookies",
+  "cookie_auto_refresh": true,
+  "cookie_refresh_interval_sec": 600,
+  "webapi_watchdog_sec": 120,
   "tool_retry_attempts": 1
 }
 ```
@@ -250,7 +256,12 @@ Agent-related config:
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
-- `reuse_upstream_sessions`: experimental Gemini Web continuation, default `false`; this account returns 1096/1097, so enable it only after a real two-turn continuation test succeeds for another account
+- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for Chat Completions, Claude Messages, Codex Responses, and agent tool loops. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
+- `upstream_session_backend`: `gemini_webapi` uses dynamic page tokens/model headers and cookie refresh; `direct` retains the legacy request builder
+- `upstream_session_fallback_direct`: replay full history through the direct backend if the primary backend cannot initialize or resume
+- `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it
+- `cookie_auto_refresh` / `cookie_refresh_interval_sec`: rotate and persist `__Secure-1PSIDTS` in the background
+- `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
@@ -328,24 +339,25 @@ resp = client.chat.completions.create(
 
 - **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
+- **Unofficial upstream protocol**: Google web protocol, model-header, or risk-control changes can still break continuation. Full-history replay is a fallback, not an official API stability guarantee.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 
 ## Requirements
 
-- Python 3.8+
-- `httpx` (`pip install httpx`) — used for streaming requests
+- Python 3.10+
+- `gemini-webapi` for dynamic authentication, model discovery, cookie rotation, and chat metadata
+- `httpx` for streaming on the legacy direct fallback
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works
 
-This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal protobuf-like format.
-
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
+This tool converts OpenAI, Anthropic, and Gemini requests into Gemini Web conversations. Its primary session backend reuses `HanaokaYuzu/Gemini-API` for dynamic page tokens, model discovery, cookie rotation, and `ChatSession.metadata`; SQLite links that metadata to client-visible history. The older `[79]` mode payload remains only as a direct fallback.
 
 ## Acknowledgments
 
 - Inspired by the open-source API proxy ecosystem
+- [HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) for the dynamic Gemini Web session client
+- [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI) for persistent history-prefix session matching design
 
 ## License
 

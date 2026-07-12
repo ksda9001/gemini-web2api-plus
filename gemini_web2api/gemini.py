@@ -121,12 +121,20 @@ def _build_payload(
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     conversation = conversation or {}
-    inner[2] = [
-        conversation.get("conversation_id", ""),
-        conversation.get("response_id", ""),
-        conversation.get("choice_id", ""),
-        None, None, None, None, None, None, "",
-    ]
+    metadata = conversation.get("metadata")
+    if isinstance(metadata, list):
+        inner[2] = list(metadata[:10])
+        inner[2].extend([None] * (10 - len(inner[2])))
+        if inner[2][9] is None:
+            inner[2][9] = ""
+    else:
+        inner[2] = [
+            conversation.get("conversation_id", ""),
+            conversation.get("response_id", ""),
+            conversation.get("choice_id", ""),
+            None, None, None, None, None, None,
+            conversation.get("context", ""),
+        ]
     inner[6] = [0]
     inner[7] = 1
     inner[10] = 1
@@ -205,10 +213,21 @@ def _extract_conversation_state(raw: str) -> dict:
                 and isinstance(choice_id, str)
                 and choice_id
             ):
+                metadata = list(ids[:10])
+                metadata.extend([None] * (10 - len(metadata)))
+                metadata[2] = choice_id
+                context = inner[25] if len(inner) > 25 and isinstance(inner[25], str) else ""
+                if context:
+                    metadata[9] = context
+                elif metadata[9] is None:
+                    metadata[9] = ""
                 return {
+                    "backend": "direct",
+                    "metadata": metadata,
                     "conversation_id": ids[0],
                     "response_id": ids[1],
                     "choice_id": choice_id,
+                    "context": metadata[9],
                 }
         except (json.JSONDecodeError, IndexError, TypeError):
             continue
@@ -328,8 +347,32 @@ def generate_with_state(
     extra_fields: dict = None,
     conversation: dict = None,
     fallback_prompt: str = None,
+    model_name: str = None,
 ) -> tuple:
     """Generate text and return Gemini Web conversation state for the next turn."""
+    session_backend = CONFIG.get("upstream_session_backend", "direct")
+    can_use_webapi = (
+        CONFIG.get("reuse_upstream_sessions", False)
+        and session_backend == "gemini_webapi"
+        and not file_refs
+        and (not conversation or conversation.get("backend") in (None, "gemini_webapi"))
+    )
+    if can_use_webapi:
+        try:
+            from .webapi_backend import generate_with_state as webapi_generate
+
+            selected_name = model_name or CONFIG.get("default_model", "gemini-3.5-flash")
+            text, state = webapi_generate(prompt, selected_name, conversation)
+            if not text:
+                raise RuntimeError("Gemini webapi backend returned an empty response")
+            return text, state, prompt
+        except Exception as e:
+            if not CONFIG.get("upstream_session_fallback_direct", True):
+                raise
+            log(f"Gemini webapi session failed; rebuilding through direct backend: {e}")
+            prompt = fallback_prompt or prompt
+            conversation = None
+
     last_err = None
     active_conversation = conversation
     active_prompt = prompt

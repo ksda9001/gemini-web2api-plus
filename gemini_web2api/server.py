@@ -161,12 +161,42 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 return delta_prompt, full_prompt, images, session["upstream_state"], True
         return full_prompt, full_prompt, images, None, False
 
+    def _prepare_plain_turn(self, messages: list, model_name: str):
+        full_prompt, images = messages_to_prompt(messages, None, "none")
+        session = (
+            _response_store().find_conversation_session(model_name, messages)
+            if CONFIG.get("reuse_upstream_sessions", False)
+            else {}
+        )
+        if session:
+            delta_prompt, _ = messages_to_prompt(
+                session["delta_messages"], None, "none", include_agent_instruction=False
+            )
+            if delta_prompt.strip():
+                return delta_prompt, full_prompt, images, session["upstream_state"]
+        return full_prompt, full_prompt, images, None
+
+    def _save_conversation_turn(
+        self, model_name: str, upstream_state: dict, input_messages: list,
+        assistant_message: dict, fallback_used: bool = False,
+    ):
+        if (
+            not CONFIG.get("reuse_upstream_sessions", False)
+            or not upstream_state
+            or fallback_used
+        ):
+            return
+        _response_store().save_conversation_session(
+            model_name, upstream_state, list(input_messages or []) + [assistant_message]
+        )
+
     def _generate_agent_turn(
         self,
         prompt: str,
         fallback_prompt: str,
         model_id: int,
         think_mode: int,
+        model_name: str,
         images: list,
         extra_fields: dict,
         upstream_state: dict,
@@ -181,6 +211,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             extra_fields,
             upstream_state,
             fallback_prompt,
+            model_name=model_name,
         )
         return self._run_with_sse_heartbeats(callback) if stream_started else callback()
 
@@ -315,8 +346,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 chat_messages, tools, tool_choice, model_name
             )
         else:
-            prompt, images = messages_to_prompt(chat_messages, None, "none")
-            fallback_prompt, upstream_state, resumed = prompt, None, False
+            prompt, fallback_prompt, images, upstream_state = self._prepare_plain_turn(
+                chat_messages, model_name
+            )
+            resumed = bool(upstream_state)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -327,12 +360,51 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
-                deltas = generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields)
-                for delta in self._iter_with_sse_heartbeats(deltas):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                webapi_stream = None
+                if (
+                    CONFIG.get("reuse_upstream_sessions", False)
+                    and CONFIG.get("upstream_session_backend") == "gemini_webapi"
+                    and not images
+                ):
+                    from .webapi_backend import generate_stream_with_state
+                    webapi_stream = generate_stream_with_state(prompt, model_name, upstream_state)
+                    deltas = webapi_stream
+                else:
+                    deltas = generate_stream(
+                        fallback_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    )
+                streamed_text = ""
+                emitted = False
+                try:
+                    iterator = self._iter_with_sse_heartbeats(deltas)
+                    for delta in iterator:
+                        emitted = True
+                        streamed_text += delta
+                        chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                 "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                except Exception:
+                    if emitted or webapi_stream is None or not CONFIG.get("upstream_session_fallback_direct", True):
+                        raise
+                    for delta in self._iter_with_sse_heartbeats(
+                        generate_stream(
+                            fallback_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                        )
+                    ):
+                        streamed_text += delta
+                        chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                 "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                    webapi_stream = None
+                if webapi_stream and webapi_stream.state:
+                    self._save_conversation_turn(
+                        model_name,
+                        webapi_stream.state,
+                        chat_messages,
+                        {"role": "assistant", "content": streamed_text},
+                    )
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
@@ -357,6 +429,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 fallback_prompt,
                 model_id,
                 think_mode,
+                model_name,
                 images,
                 extra_fields,
                 upstream_state,
@@ -388,6 +461,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         retry_fallback,
                         model_id,
                         think_mode,
+                        model_name,
                         images,
                         extra_fields,
                         upstream_state,
@@ -417,6 +491,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 msg,
                 fallback_used,
             )
+        self._save_conversation_turn(
+            model_name, upstream_state, chat_messages, msg, fallback_used
+        )
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
@@ -654,6 +731,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 fallback_prompt,
                 model_id,
                 think_mode,
+                model_name,
                 images,
                 extra_fields,
                 upstream_state,
@@ -680,6 +758,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         build_tool_retry_prompt(fallback_prompt, tool_choice, tools),
                         model_id,
                         think_mode,
+                        model_name,
                         images,
                         extra_fields,
                         upstream_state,
@@ -907,8 +986,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 anthropic_messages, tools, tool_choice, model_name
             )
         else:
-            prompt, images = messages_to_prompt(anthropic_messages, None, "none")
-            fallback_prompt, upstream_state = prompt, None
+            prompt, fallback_prompt, images, upstream_state = self._prepare_plain_turn(
+                anthropic_messages, model_name
+            )
         if not prompt.strip():
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
@@ -922,6 +1002,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 fallback_prompt,
                 model_id,
                 think_mode,
+                model_name,
                 images,
                 extra_fields,
                 upstream_state,
@@ -949,6 +1030,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         build_tool_retry_prompt(fallback_prompt, tool_choice, tools),
                         model_id,
                         think_mode,
+                        model_name,
                         images,
                         extra_fields,
                         upstream_state,
@@ -987,6 +1069,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 assistant_message,
                 fallback_used,
             )
+        self._save_conversation_turn(
+            model_name, upstream_state, anthropic_messages, assistant_message, fallback_used
+        )
 
         if req.get("stream"):
             if tool_calls:

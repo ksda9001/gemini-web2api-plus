@@ -4,8 +4,8 @@ version = "1.1.0"
 description = "Convert Google Gemini web into OpenAI-compatible API"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
-dependencies = []
+requires-python = ">=3.10"
+dependencies = ["gemini-webapi>=2.0.0,<3"]
 
 [project.optional-dependencies]
 streaming = ["httpx>=0.25"]

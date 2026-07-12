@@ -1,1 +1,2 @@
 httpx>=0.25
+gemini-webapi>=2.0.0,<3
