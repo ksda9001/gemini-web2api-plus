@@ -112,6 +112,7 @@ def _build_payload(
     file_refs: list = None,
     extra_fields: dict = None,
     conversation: dict = None,
+    temporary: bool = False,
 ) -> str:
     inner = [None] * 102
     if file_refs:
@@ -144,6 +145,10 @@ def _build_payload(
     inner[27] = 1
     inner[30] = [4]
     inner[41] = [2]
+    if temporary:
+        # Gemini Web's temporary-chat flag: generate normally without writing
+        # the helper request to the account's visible chat history.
+        inner[45] = 1
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -318,9 +323,10 @@ def _request_text(
     file_refs=None,
     extra_fields=None,
     conversation: dict = None,
+    temporary: bool = False,
 ) -> tuple:
     body = _build_payload(
-        prompt, model_id, think_mode, file_refs, extra_fields, conversation
+        prompt, model_id, think_mode, file_refs, extra_fields, conversation, temporary
     ).encode()
     url = _get_url()
     headers = _build_headers()
@@ -348,6 +354,7 @@ def generate_with_state(
     conversation: dict = None,
     fallback_prompt: str = None,
     model_name: str = None,
+    temporary: bool = False,
 ) -> tuple:
     """Generate text and return Gemini Web conversation state for the next turn."""
     session_backend = CONFIG.get("upstream_session_backend", "direct")
@@ -362,7 +369,12 @@ def generate_with_state(
             from .webapi_backend import generate_with_state as webapi_generate
 
             selected_name = model_name or CONFIG.get("default_model", "gemini-3.5-flash")
-            text, state = webapi_generate(prompt, selected_name, conversation)
+            text, state = webapi_generate(
+                prompt,
+                selected_name,
+                conversation,
+                temporary=temporary,
+            )
             if not text:
                 raise RuntimeError("Gemini webapi backend returned an empty response")
             return text, state, prompt
@@ -385,6 +397,7 @@ def generate_with_state(
                 file_refs,
                 extra_fields,
                 active_conversation,
+                temporary,
             )
             if not text:
                 raise RuntimeError("Gemini upstream returned an empty response")
@@ -417,6 +430,7 @@ def generate_with_state(
                     file_refs,
                     extra_fields,
                     state,
+                    temporary,
                 )
                 if not continuation:
                     raise RuntimeError("Gemini continuation returned an empty response")
@@ -442,21 +456,38 @@ def generate(
     think_mode: int,
     file_refs: list = None,
     extra_fields: dict = None,
+    temporary: bool = False,
 ) -> str:
     """Non-streaming generation with retry."""
-    text, _, _ = generate_with_state(prompt, model_id, think_mode, file_refs, extra_fields)
+    text, _, _ = generate_with_state(
+        prompt,
+        model_id,
+        think_mode,
+        file_refs,
+        extra_fields,
+        temporary=temporary,
+    )
     return text
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+    temporary: bool = False,
+):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, temporary)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+    body = _build_payload(
+        prompt, model_id, think_mode, file_refs, extra_fields, temporary=temporary
+    )
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()
@@ -492,6 +523,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     think_mode,
                     file_refs,
                     extra_fields,
+                    temporary,
                 )
                 completed = _append_continuation(emitted_text, continuation)
                 delta = completed[len(emitted_text):]

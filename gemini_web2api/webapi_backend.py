@@ -186,17 +186,30 @@ class GeminiWebAPIBackend:
                 return model
         return target
 
-    async def _generate(self, prompt: str, model_name: str, state: dict = None):
+    async def _generate(
+        self,
+        prompt: str,
+        model_name: str,
+        state: dict = None,
+        temporary: bool = False,
+    ):
         client = await self._ensure_client()
         chat = _start_isolated_chat(client, self._model(client, model_name), state)
-        output = await chat.send_message(prompt)
+        output = await chat.send_message(prompt, temporary=temporary)
         return output.text, metadata_to_state(chat.metadata)
 
-    async def _stream(self, result, prompt: str, model_name: str, state: dict = None):
+    async def _stream(
+        self,
+        result,
+        prompt: str,
+        model_name: str,
+        state: dict = None,
+        temporary: bool = False,
+    ):
         try:
             client = await self._ensure_client()
             chat = _start_isolated_chat(client, self._model(client, model_name), state)
-            async for output in chat.send_message_stream(prompt):
+            async for output in chat.send_message_stream(prompt, temporary=temporary):
                 if output.text_delta:
                     result._queue.put(("delta", output.text_delta))
             result.state = metadata_to_state(chat.metadata)
@@ -204,18 +217,32 @@ class GeminiWebAPIBackend:
         except BaseException as exc:
             result._queue.put(("error", exc))
 
-    def generate(self, prompt: str, model_name: str, state: dict = None) -> tuple:
+    def generate(
+        self,
+        prompt: str,
+        model_name: str,
+        state: dict = None,
+        temporary: bool = False,
+    ) -> tuple:
         timeout = _request_timeout()
-        future = self._submit(self._generate(prompt, model_name, state))
+        future = self._submit(self._generate(prompt, model_name, state, temporary))
         try:
             return future.result(timeout=timeout)
         except FutureTimeoutError:
             future.cancel()
             raise TimeoutError(f"Gemini webapi request exceeded {timeout}s")
 
-    def generate_stream(self, prompt: str, model_name: str, state: dict = None):
+    def generate_stream(
+        self,
+        prompt: str,
+        model_name: str,
+        state: dict = None,
+        temporary: bool = False,
+    ):
         result = SyncWebAPIStream(_request_timeout())
-        result._future = self._submit(self._stream(result, prompt, model_name, state))
+        result._future = self._submit(
+            self._stream(result, prompt, model_name, state, temporary)
+        )
         return result
 
 
@@ -255,9 +282,19 @@ def backend() -> GeminiWebAPIBackend:
         return _BACKEND
 
 
-def generate_with_state(prompt: str, model_name: str, state: dict = None) -> tuple:
-    return backend().generate(prompt, model_name, state)
+def generate_with_state(
+    prompt: str,
+    model_name: str,
+    state: dict = None,
+    temporary: bool = False,
+) -> tuple:
+    return backend().generate(prompt, model_name, state, temporary)
 
 
-def generate_stream_with_state(prompt: str, model_name: str, state: dict = None):
-    return backend().generate_stream(prompt, model_name, state)
+def generate_stream_with_state(
+    prompt: str,
+    model_name: str,
+    state: dict = None,
+    temporary: bool = False,
+):
+    return backend().generate_stream(prompt, model_name, state, temporary)

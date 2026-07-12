@@ -81,6 +81,8 @@ class HttpHarness:
             "max_google_prompt_chars": 18000,
             "google_stream_auto_tools": False,
             "reuse_upstream_sessions": reuse_upstream_sessions,
+            "upstream_session_backend": "gemini_webapi",
+            "upstream_session_fallback_direct": True,
             "tool_retry_attempts": 1,
         })
         self.httpd = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
@@ -296,6 +298,40 @@ class AgentCompatTests(unittest.TestCase):
         rebuilt = json.loads(outer[1])
         self.assertEqual(rebuilt[2], state["metadata"])
 
+    def test_direct_protocol_marks_background_task_temporary(self):
+        payload = urllib.parse.parse_qs(
+            gemini._build_payload("make a title", 1, 0, temporary=True)
+        )
+        outer = json.loads(payload["f.req"][0])
+        inner = json.loads(outer[1])
+        self.assertEqual(inner[45], 1)
+
+        normal_payload = urllib.parse.parse_qs(
+            gemini._build_payload("ordinary chat", 1, 0)
+        )
+        normal_outer = json.loads(normal_payload["f.req"][0])
+        normal_inner = json.loads(normal_outer[1])
+        self.assertIsNone(normal_inner[45])
+
+    def test_openwebui_metadata_templates_use_temporary_chat(self):
+        prompts = [
+            "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.",
+            "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history",
+            "### Task:\nSuggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next",
+            "### Task:\nGenerate a detailed prompt for am image generation task based on the given language and context.",
+        ]
+        previous = CONFIG.get("temporary_background_tasks")
+        try:
+            CONFIG["temporary_background_tasks"] = True
+            for prompt in prompts:
+                self.assertTrue(server._is_background_metadata_prompt(prompt))
+            self.assertFalse(server._is_background_metadata_prompt("记住123"))
+            self.assertFalse(server._is_background_metadata_prompt("帮我生成三个标签"))
+            CONFIG["temporary_background_tasks"] = False
+            self.assertFalse(server._is_background_metadata_prompt(prompts[0]))
+        finally:
+            CONFIG["temporary_background_tasks"] = previous
+
     def test_webapi_metadata_round_trip_keeps_context(self):
         metadata = ["c1", "r2", "rc3", None, None, None, None, None, None, "context"]
         state = metadata_to_state(metadata)
@@ -430,7 +466,41 @@ class AgentCompatTests(unittest.TestCase):
         self.assertEqual(text, "continued")
         self.assertEqual(returned_state, state)
         self.assertEqual(usage_prompt, "new tool result")
-        webapi_generate.assert_called_once_with("new tool result", "gemini-3.5-flash", state)
+        webapi_generate.assert_called_once_with(
+            "new tool result",
+            "gemini-3.5-flash",
+            state,
+            temporary=False,
+        )
+
+    def test_generate_with_state_forwards_temporary_to_webapi(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in ("reuse_upstream_sessions", "upstream_session_backend")
+        }
+        CONFIG.update({"reuse_upstream_sessions": True, "upstream_session_backend": "gemini_webapi"})
+        state = metadata_to_state(["", "", "", None, None, None, None, None, None, ""])
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                return_value=("title", state),
+            ) as webapi_generate:
+                text, _, _ = gemini.generate_with_state(
+                    "title helper",
+                    1,
+                    0,
+                    model_name="gemini-3.5-flash",
+                    temporary=True,
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "title")
+        webapi_generate.assert_called_once_with(
+            "title helper",
+            "gemini-3.5-flash",
+            None,
+            temporary=True,
+        )
 
     def test_webapi_failure_replays_full_prompt_through_direct_backend(self):
         previous = {
@@ -470,6 +540,44 @@ class AgentCompatTests(unittest.TestCase):
         self.assertEqual(usage_prompt, "full history")
         self.assertEqual(direct_request.call_args.args[0], "full history")
         self.assertIsNone(direct_request.call_args.args[5])
+
+    def test_temporary_survives_webapi_fallback_to_direct(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "reuse_upstream_sessions",
+                "upstream_session_backend",
+                "upstream_session_fallback_direct",
+                "retry_attempts",
+            )
+        }
+        CONFIG.update({
+            "reuse_upstream_sessions": True,
+            "upstream_session_backend": "gemini_webapi",
+            "upstream_session_fallback_direct": True,
+            "retry_attempts": 1,
+        })
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                side_effect=RuntimeError("temporary backend failed"),
+            ), patch.object(
+                gemini,
+                "_request_text",
+                return_value=("temporary result", False, {}),
+            ) as direct_request:
+                text, _, _ = gemini.generate_with_state(
+                    "metadata helper",
+                    1,
+                    0,
+                    fallback_prompt="metadata helper",
+                    model_name="gemini-3.5-flash",
+                    temporary=True,
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "temporary result")
+        self.assertTrue(direct_request.call_args.args[6])
 
     def test_generate_continues_truncated_output_without_duplicate_overlap(self):
         responses = iter([
@@ -1209,7 +1317,7 @@ class AgentCompatTests(unittest.TestCase):
 
     def test_google_stream_auto_tools_uses_text_stream_without_tool_prompt(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-            harness = HttpHarness(tmpdir, ["完整回答"])
+            harness = HttpHarness(tmpdir, ["完整回答"], reuse_upstream_sessions=False)
             try:
                 events = harness.post_sse("/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse", {
                     "contents": [{"role": "user", "parts": [{"text": "普通聊天，不需要工具"}]}],
@@ -1221,6 +1329,60 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(data_events[-1]["candidates"][0]["finishReason"], "STOP")
                 self.assertEqual(len(harness.prompts), 1)
                 self.assertNotIn("# Tool Use", harness.prompts[0])
+            finally:
+                harness.close()
+
+    def test_google_stream_reuses_same_upstream_conversation(self):
+        class FakeWebStream:
+            def __init__(self, text, state):
+                self.text = text
+                self._state = state
+                self.state = None
+
+            def __iter__(self):
+                yield self.text
+                self.state = self._state
+
+        first_state = metadata_to_state(
+            ["same-cid", "r1", "rc1", None, None, None, None, None, None, "ctx1"]
+        )
+        second_state = metadata_to_state(
+            ["same-cid", "r2", "rc2", None, None, None, None, None, None, "ctx2"]
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [])
+            try:
+                with patch(
+                    "gemini_web2api.webapi_backend.generate_stream_with_state",
+                    side_effect=[
+                        FakeWebStream("已记住123", first_state),
+                        FakeWebStream("记得，是123", second_state),
+                    ],
+                ) as webapi_stream:
+                    first = harness.post_sse(
+                        "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+                        {"contents": [{"role": "user", "parts": [{"text": "记住123"}]}]},
+                    )
+                    second = harness.post_sse(
+                        "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+                        {"contents": [
+                            {"role": "user", "parts": [{"text": "记住123"}]},
+                            {"role": "model", "parts": [{"text": "已记住123"}]},
+                            {"role": "user", "parts": [{"text": "还记得什么？"}]},
+                        ]},
+                    )
+                first_text = first[0]["data"]["candidates"][0]["content"]["parts"][0]["text"]
+                second_text = second[0]["data"]["candidates"][0]["content"]["parts"][0]["text"]
+                self.assertEqual(first_text, "已记住123")
+                self.assertEqual(second_text, "记得，是123")
+                self.assertEqual(webapi_stream.call_count, 2)
+                self.assertEqual(webapi_stream.call_args_list[0].args[0], "记住123")
+                self.assertIsNone(webapi_stream.call_args_list[0].args[2])
+                self.assertEqual(webapi_stream.call_args_list[1].args[0], "还记得什么？")
+                self.assertEqual(
+                    webapi_stream.call_args_list[1].args[2]["conversation_id"],
+                    "same-cid",
+                )
             finally:
                 harness.close()
 

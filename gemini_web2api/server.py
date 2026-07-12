@@ -43,6 +43,24 @@ from . import __version__
 RESPONSE_STORE = None
 
 
+# Open WebUI sends model requests for its own title, tags, follow-up, and image
+# prompt UI features. They contain the user's chat text, but are not user turns.
+# Keep their output out of the account's visible Gemini history.
+OPEN_WEBUI_BACKGROUND_TASK_MARKERS = (
+    "Generate a concise, 3-5 word title with an emoji summarizing the chat history.",
+    "Generate 1-3 broad tags categorizing the main themes of the chat history",
+    "Suggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next",
+    "Generate a detailed prompt for am image generation task based on the given language and context.",
+)
+
+
+def _is_background_metadata_prompt(prompt: str) -> bool:
+    """Recognize Open WebUI's default metadata-task templates without matching user chat."""
+    if not CONFIG.get("temporary_background_tasks", True) or not isinstance(prompt, str):
+        return False
+    return any(marker in prompt for marker in OPEN_WEBUI_BACKGROUND_TASK_MARKERS)
+
+
 def _response_store() -> ResponseStore:
     global RESPONSE_STORE
     if RESPONSE_STORE is None:
@@ -175,6 +193,33 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if delta_prompt.strip():
                 return delta_prompt, full_prompt, images, session["upstream_state"]
         return full_prompt, full_prompt, images, None
+
+    def _prepare_google_plain_turn(
+        self,
+        messages: list,
+        full_prompt: str,
+        model_name: str,
+        temporary: bool,
+    ):
+        """Resume a Google-native plain chat while retaining its exact fallback prompt."""
+        session = (
+            _response_store().find_conversation_session(model_name, messages)
+            if (
+                not temporary
+                and CONFIG.get("reuse_upstream_sessions", False)
+            )
+            else {}
+        )
+        if session:
+            delta_prompt, _ = messages_to_prompt(
+                session["delta_messages"],
+                None,
+                "none",
+                include_agent_instruction=False,
+            )
+            if delta_prompt.strip():
+                return delta_prompt, session["upstream_state"]
+        return full_prompt, None
 
     def _save_conversation_turn(
         self, model_name: str, upstream_state: dict, input_messages: list,
@@ -1113,37 +1158,110 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tools = google_tools_to_openai(req)
         tool_choice = google_tool_choice_to_openai(req)
         google_messages = google_contents_to_messages(req)
-        prompt, images = google_contents_to_prompt(req)
-        if not prompt.strip():
+        full_prompt, images = google_contents_to_prompt(req)
+        if not full_prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
+        temporary = _is_background_metadata_prompt(full_prompt)
         max_google_prompt_chars = int(CONFIG.get("max_google_prompt_chars", 18000) or 0)
-        if max_google_prompt_chars > 0 and len(prompt) > max_google_prompt_chars:
-            omitted = len(prompt) - max_google_prompt_chars
-            prompt = (
+        if max_google_prompt_chars > 0 and len(full_prompt) > max_google_prompt_chars:
+            omitted = len(full_prompt) - max_google_prompt_chars
+            full_prompt = (
                 f"[Earlier Google native context omitted: {omitted} characters. "
                 "Continue using the recent conversation below.]\n\n"
-                + prompt[-max_google_prompt_chars:]
+                + full_prompt[-max_google_prompt_chars:]
             )
 
         file_refs = _upload_images(images)
-        log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
+        upstream_state = None
+        prompt = full_prompt
+        if not has_tools and not file_refs:
+            prompt, upstream_state = self._prepare_google_plain_turn(
+                google_messages,
+                full_prompt,
+                model_name,
+                temporary,
+            )
+        log(
+            f"Google API: model={model_name} stream={stream} tools={has_tools} "
+            f"temporary={temporary} resumed={bool(upstream_state)} "
+            f"prompt_len={len(prompt)} fallback_len={len(full_prompt)}"
+        )
 
         if stream and not has_tools:
             try:
                 self._start_sse()
                 full_text = ""
-                deltas = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
-                for delta in self._iter_with_sse_heartbeats(deltas):
-                    if not delta:
-                        continue
-                    full_text += delta
-                    chunk_obj = {
-                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
-                        "modelVersion": model_name,
-                    }
-                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                webapi_stream = None
+                if (
+                    CONFIG.get("reuse_upstream_sessions", False)
+                    and CONFIG.get("upstream_session_backend") == "gemini_webapi"
+                    and not file_refs
+                ):
+                    from .webapi_backend import generate_stream_with_state
+                    webapi_stream = generate_stream_with_state(
+                        prompt,
+                        model_name,
+                        upstream_state,
+                        temporary=temporary,
+                    )
+                    deltas = webapi_stream
+                else:
+                    deltas = generate_stream(
+                        full_prompt,
+                        model_id,
+                        think_mode,
+                        file_refs,
+                        extra_fields,
+                        temporary=temporary,
+                    )
+                emitted = False
+                try:
+                    for delta in self._iter_with_sse_heartbeats(deltas):
+                        if not delta:
+                            continue
+                        emitted = True
+                        full_text += delta
+                        chunk_obj = {
+                            "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                            "modelVersion": model_name,
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                except Exception:
+                    if (
+                        emitted
+                        or webapi_stream is None
+                        or not CONFIG.get("upstream_session_fallback_direct", True)
+                    ):
+                        raise
+                    for delta in self._iter_with_sse_heartbeats(
+                        generate_stream(
+                            full_prompt,
+                            model_id,
+                            think_mode,
+                            file_refs,
+                            extra_fields,
+                            temporary=temporary,
+                        )
+                    ):
+                        if not delta:
+                            continue
+                        full_text += delta
+                        chunk_obj = {
+                            "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                            "modelVersion": model_name,
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                    webapi_stream = None
+                if webapi_stream and webapi_stream.state and not temporary:
+                    self._save_conversation_turn(
+                        model_name,
+                        webapi_stream.state,
+                        google_messages,
+                        {"role": "assistant", "content": full_text},
+                    )
                 final_chunk = {
                     "candidates": [{"finishReason": "STOP", "index": 0}],
                     "usageMetadata": {
@@ -1164,7 +1282,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text, upstream_state, usage_prompt = generate_with_state(
+                prompt,
+                model_id,
+                think_mode,
+                file_refs,
+                extra_fields,
+                upstream_state,
+                full_prompt,
+                model_name=model_name,
+                temporary=temporary,
+            )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1181,7 +1309,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                     retry_prompt = build_google_tool_retry_prompt(prompt, req)
                     try:
-                        retry_text = generate(retry_prompt, model_id, think_mode, file_refs, extra_fields)
+                        retry_text, upstream_state, _ = generate_with_state(
+                            retry_prompt,
+                            model_id,
+                            think_mode,
+                            file_refs,
+                            extra_fields,
+                            upstream_state,
+                            build_google_tool_retry_prompt(full_prompt, req),
+                            model_name=model_name,
+                            temporary=temporary,
+                        )
                     except Exception:
                         break
                     retry_clean, retry_calls = parse_google_function_calls(retry_text or "")
@@ -1197,6 +1335,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 response_parts.append({"text": text or ""})
         else:
             response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
+
+        if not has_tools and not temporary:
+            self._save_conversation_turn(
+                model_name,
+                upstream_state,
+                google_messages,
+                {"role": "assistant", "content": text or ""},
+            )
 
         candidate = {
             "content": {"parts": response_parts, "role": "model"},

@@ -132,7 +132,7 @@ Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`
 
 Tool-free OpenAI, Responses, and Anthropic requests do not receive the Agent behavior instruction. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; requests that actually provide tools keep complete agent behavior. On an agent request, the full Agent behavior instruction is injected only before the first tool call. Follow-up requests whose history already contains a tool call/result omit that instruction.
 
-Clients normally include `tools` in every HTTP request as part of Codex, Claude, and Copilot model protocols. With `reuse_upstream_sessions` enabled, the server uses `gemini-webapi` for live page tokens, dynamic model headers, cookie rotation, and complete conversation metadata. SQLite restores sessions by message-history prefix or tool call ID, so follow-up turns send only new messages/tool results. If authentication or metadata continuation fails, the request automatically falls back to compressed full-history replay through the legacy direct backend. The connected agent client still executes each tool and drives the loop until the model returns a final answer.
+Clients normally include `tools` in every HTTP request as part of Codex, Claude, and Copilot model protocols. With `reuse_upstream_sessions` enabled, the server uses `gemini-webapi` for live page tokens, dynamic model headers, cookie rotation, and complete conversation metadata. SQLite restores sessions by message-history prefix or tool call ID, so follow-up turns send only new messages/tool results. This applies to OpenAI Chat Completions, Codex Responses, Claude Messages, and Google-native `/v1beta` plain chats used by Open WebUI. If authentication or metadata continuation fails, the request automatically falls back to compressed full-history replay through the legacy direct backend. The connected agent client still executes each tool and drives the loop until the model returns a final answer.
 
 ## Available Models
 
@@ -242,7 +242,8 @@ Create `config.json` in the same directory:
   "cookie_refresh_interval_sec": 600,
   "webapi_watchdog_sec": 120,
   "webapi_request_timeout_sec": 180,
-  "tool_retry_attempts": 1
+  "tool_retry_attempts": 1,
+  "temporary_background_tasks": true
 }
 ```
 
@@ -257,7 +258,7 @@ Agent-related config:
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
-- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for Chat Completions, Claude Messages, Codex Responses, and agent tool loops. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
+- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for Chat Completions, Claude Messages, Codex Responses, Google-native `/v1beta` plain chats, and agent tool loops. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
 - `upstream_session_backend`: `gemini_webapi` uses dynamic page tokens/model headers and cookie refresh; `direct` retains the legacy request builder
 - `upstream_session_fallback_direct`: replay full history through the direct backend if the primary backend cannot initialize or resume
 - `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it
@@ -265,6 +266,7 @@ Agent-related config:
 - `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
 - `webapi_request_timeout_sec`: total wait for non-stream requests and idle wait between streaming deltas; expiration cancels the background task and allows the configured direct fallback
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
+- `temporary_background_tasks`: recognize Open WebUI's default title, tags, follow-up, and image-prompt helper requests and send them as Gemini temporary chats, so only the real conversation appears in Gemini Web history
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 
