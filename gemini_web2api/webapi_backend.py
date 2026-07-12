@@ -220,8 +220,15 @@ class GeminiWebAPIBackend:
     ):
         client = await self._ensure_client()
         chat = _start_isolated_chat(client, self._model(client, model_name), state)
-        output = await chat.send_message(prompt, temporary=temporary)
-        return output.text, metadata_to_state(chat.metadata)
+        # Gemini Web's non-streaming helper can wait indefinitely after its
+        # upstream StreamGenerate request has started. The streaming variant is
+        # the same Web endpoint but completes reliably, so collect its deltas
+        # for callers that need one complete response (agent tool decisions).
+        text = ""
+        async for output in chat.send_message_stream(prompt, temporary=temporary):
+            if output.text_delta:
+                text += output.text_delta
+        return text, metadata_to_state(chat.metadata)
 
     async def _stream(
         self,

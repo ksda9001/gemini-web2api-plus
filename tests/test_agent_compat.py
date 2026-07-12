@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sqlite3
@@ -400,6 +401,53 @@ class AgentCompatTests(unittest.TestCase):
             account_status = Status()
 
         webapi_backend._assert_authenticated(FakeClient())
+
+    def test_webapi_non_stream_generation_collects_stream_deltas(self):
+        class Output:
+            def __init__(self, delta):
+                self.text_delta = delta
+
+        class FakeChat:
+            _ChatSession__metadata = ["cid", "rid", "rcid", None, None, None, None, None, None, ""]
+
+            @property
+            def metadata(self):
+                return self._ChatSession__metadata
+
+            async def send_message_stream(self, prompt, temporary=False):
+                self.prompt = prompt
+                self.temporary = temporary
+                yield Output('{"name":"shell_')
+                yield Output('command","arguments":{}}')
+                self._ChatSession__metadata = [
+                    "cid", "rid-next", "rcid-next", None, None,
+                    None, None, None, None, "",
+                ]
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = FakeChat()
+
+            def start_chat(self, model):
+                return self.chat
+
+            def list_models(self):
+                return []
+
+        backend = object.__new__(webapi_backend.GeminiWebAPIBackend)
+        fake_client = FakeClient()
+
+        async def ensure_client():
+            return fake_client
+
+        backend._ensure_client = ensure_client
+        text, state = asyncio.run(
+            backend._generate("call the tool", "gemini-3.5-flash", temporary=True)
+        )
+        self.assertEqual(text, '{"name":"shell_command","arguments":{}}')
+        self.assertEqual(state["conversation_id"], "cid")
+        self.assertEqual(fake_client.chat.prompt, "call the tool")
+        self.assertTrue(fake_client.chat.temporary)
 
     def test_webapi_dependency_imports_client_and_model_when_installed(self):
         try:
