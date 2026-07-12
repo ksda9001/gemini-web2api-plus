@@ -99,7 +99,12 @@ def openai_tool_choice_from_request(req: dict):
     return "auto"
 
 
-def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
+def messages_to_prompt(
+    messages: list,
+    tools: list = None,
+    tool_choice=None,
+    include_agent_instruction: bool = None,
+) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
     Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
@@ -107,9 +112,13 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     parts = []
     images = []
 
-    parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
+    agent_tools = bool(tools) and tool_choice != "none"
+    if include_agent_instruction is None:
+        include_agent_instruction = agent_tools
+    if include_agent_instruction:
+        parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
 
-    if tools and tool_choice != "none":
+    if agent_tools:
         tool_defs = []
         for tool in tools:
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
@@ -126,7 +135,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
                 "When calling tools, output ONLY the tool_call block(s) or raw JSON tool call object(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':'))}"
                 f"{constraint}"
             )
 

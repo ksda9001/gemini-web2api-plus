@@ -25,7 +25,7 @@
 
 ```bash
 pip install httpx
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 服务启动在 `http://localhost:8081/v1`.
@@ -109,6 +109,8 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 Agent 兼容能力包括:
 - 当模型只描述动作而没有调用工具时, 自动进行一次工具调用修复重试
 - 使用 SQLite 保存 Responses 历史, 支持 `previous_response_id` 和 `GET /v1/responses/{id}`
+- 使用 SQLite 保存 Gemini Web 的 `conversation_id` / `response_id` / `choice_id`, 让多步 agent 复用真实上游会话
+- Agent 指令和紧凑工具 schema 仅在上游会话首轮发送；后续只发送新增工具结果或用户消息
 - 对超长工具输出和旧历史做确定性截断/压缩
 - 在 prompt 上下文中保留 Anthropic `thinking` / `redacted_thinking` 信息
 
@@ -116,7 +118,9 @@ Agent 兼容能力包括:
 
 Google 原生流式接口 (`/v1beta/models/{model}:streamGenerateContent`) 默认将 `google_stream_auto_tools` 设为 `false`. Open WebUI/NewAPI 这类聊天集成有时会在普通聊天里也发送 `tools` 和 `functionCallingConfig.mode=AUTO`. 如果把这些工具 schema 注入 Gemini Web prompt, prompt 会明显膨胀, 容易触发空回复或截断, 所以默认会把这个特定的 stream AUTO 场景当作普通流式聊天处理.
 
-这不会关闭 agent 能力. Codex 走 `/v1/responses`, Claude Code 走 `/v1/messages`, Copilot/OpenAI 兼容 agent 走 `/v1/chat/completions`; 这些端点仍保留工具调用、修复重试、SQLite 的 `previous_response_id` 状态和多步执行能力. 非流式 Google 原生 `generateContent` 也保留 function calling. 只有在你明确需要 Google 原生流式 AUTO 工具调用, 并且能接受更高的 prompt 膨胀/截断风险时, 才建议把 `google_stream_auto_tools` 改成 `true`.
+没有工具的 OpenAI/Responses/Anthropic 请求也不会再注入 Agent behavior 指令。Codex 走 `/v1/responses`, Claude Code 走 `/v1/messages`, Copilot/OpenAI 兼容 agent 走 `/v1/chat/completions`; 当这些客户端确实发送工具时, 首轮仍会建立完整工具能力，后续轮则通过 SQLite 保存的 Gemini Web 上游会话继续执行，不重复发送 Agent 指令、完整历史和工具 schema。如果上游会话过期或失效，服务会自动使用压缩后的完整历史重建，不会直接丢失上下文。
+
+客户端可能仍会在每个 HTTP 请求里携带 `tools`，这是 Codex/Claude/Copilot 的协议行为；本服务会在续接成功时阻止这些重复定义再次进入 Gemini Web prompt，所以不会重复消耗对应的上游 prompt token。非流式 Google 原生 `generateContent` 仍保留 function calling。只有在明确需要 Google 原生流式 AUTO 工具调用时，才建议把 `google_stream_auto_tools` 改成 `true`。
 
 ## 可用模型
 
@@ -144,7 +148,7 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### 如何获取 Cookie
@@ -218,6 +222,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "google_stream_auto_tools": false,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
+  "reuse_upstream_sessions": true,
   "tool_retry_attempts": 1
 }
 ```
@@ -233,6 +238,7 @@ Agent 相关配置:
 - `google_stream_auto_tools`: 保持 `false` 可优先保证 Open WebUI/NewAPI 这类流式聊天稳定；只有需要 Google 原生流式 AUTO 工具调用时才设为 `true`
 - `continuation_attempts`: Gemini Web 明确返回输出上限标记 (`BardErrorInfo 1155`) 时，自动从断点续写的最大轮数
 - `sse_heartbeat_sec`: 等待 Gemini 首段或 agent 工具决策期间发送 SSE 注释心跳的间隔，避免 NewAPI、Open WebUI 或反向代理把仍在工作的请求当成断连
+- `reuse_upstream_sessions`: 使用 SQLite 复用 Gemini Web 的真实上游会话；保持 `true` 可避免每轮重发 Agent 指令、工具 schema 和完整历史，设为 `false` 可回退到旧的无状态重放模式
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
@@ -268,7 +274,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **方式 2: config.json**
@@ -279,7 +285,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **方式 3: 环境变量** (自动检测)
 ```bash
 set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.

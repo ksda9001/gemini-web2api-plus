@@ -37,6 +37,34 @@ def json_clone(value):
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
+def tool_call_ids(messages: list) -> list:
+    ids = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            ids.append(tool_call_id)
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict):
+                call_id = call.get("id") or call.get("call_id")
+                if isinstance(call_id, str) and call_id:
+                    ids.append(call_id)
+    return list(dict.fromkeys(ids))
+
+
+def incremental_messages(messages: list, known_messages: list) -> list:
+    """Return messages added after the exact transcript represented upstream."""
+    messages = messages or []
+    known_messages = known_messages or []
+    if len(known_messages) > len(messages):
+        return []
+    for index, known in enumerate(known_messages):
+        if messages[index] != known:
+            return []
+    return json_clone(messages[len(known_messages):])
+
+
 def text_from_content(content) -> str:
     if content is None:
         return ""
@@ -170,7 +198,12 @@ def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_c
     if isinstance(tool_choice, dict):
         return True
     if latest_non_system_role(messages) == "tool":
-        return False
+        explicit_intent = re.search(
+            r"\b(?:I\s+(?:should|will|need to|must)|let me)\b|(?:我(?:会|将|需要|必须)|让我)",
+            text or "",
+            re.IGNORECASE,
+        )
+        return bool(explicit_intent and ACTION_RE.search(text or ""))
     user_text = any_user_action_text(messages) or latest_user_text(messages)
     if not user_text or not ACTION_RE.search(user_text):
         return bool(text and ACTION_RE.search(text))
@@ -306,12 +339,36 @@ class ResponseStore:
                     """
                 )
                 con.execute("CREATE INDEX IF NOT EXISTS idx_responses_updated ON responses(updated_at)")
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS upstream_sessions (
+                        response_id TEXT PRIMARY KEY,
+                        updated_at INTEGER NOT NULL,
+                        model TEXT NOT NULL,
+                        upstream_json TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS agent_sessions (
+                        call_id TEXT PRIMARY KEY,
+                        updated_at INTEGER NOT NULL,
+                        model TEXT NOT NULL,
+                        upstream_json TEXT NOT NULL,
+                        messages_json TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated ON agent_sessions(updated_at)")
             self._ready = True
 
     def _prune(self, con):
         now = int(time.time())
         if self.ttl_sec > 0:
             con.execute("DELETE FROM responses WHERE updated_at < ?", (now - self.ttl_sec,))
+            con.execute("DELETE FROM upstream_sessions WHERE updated_at < ?", (now - self.ttl_sec,))
+            con.execute("DELETE FROM agent_sessions WHERE updated_at < ?", (now - self.ttl_sec,))
         if self.max_rows > 0:
             con.execute(
                 """
@@ -321,6 +378,24 @@ class ResponseStore:
                 )
                 """,
                 (self.max_rows,),
+            )
+            con.execute(
+                """
+                DELETE FROM upstream_sessions
+                WHERE response_id NOT IN (
+                    SELECT response_id FROM upstream_sessions ORDER BY updated_at DESC LIMIT ?
+                )
+                """,
+                (self.max_rows,),
+            )
+            con.execute(
+                """
+                DELETE FROM agent_sessions
+                WHERE call_id NOT IN (
+                    SELECT call_id FROM agent_sessions ORDER BY updated_at DESC LIMIT ?
+                )
+                """,
+                (self.max_rows * 4,),
             )
 
     def save(self, response: dict, messages: list, output: list, previous_response_id: str = None):
@@ -368,6 +443,80 @@ class ResponseStore:
         with self._connection() as con:
             row = con.execute("SELECT messages_json FROM responses WHERE id = ?", (response_id,)).fetchone()
         return json.loads(row[0]) if row else []
+
+    def save_upstream_session(self, response_id: str, model: str, upstream_state: dict):
+        if not response_id or not upstream_state:
+            return
+        self._init()
+        now = int(time.time())
+        with self._lock:
+            with self._connection() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO upstream_sessions "
+                    "(response_id, updated_at, model, upstream_json) VALUES (?, ?, ?, ?)",
+                    (response_id, now, model or "", json.dumps(upstream_state, ensure_ascii=False)),
+                )
+                self._prune(con)
+
+    def get_upstream_session(self, response_id: str, model: str = None) -> dict:
+        if not response_id:
+            return {}
+        self._init()
+        with self._connection() as con:
+            row = con.execute(
+                "SELECT model, upstream_json FROM upstream_sessions WHERE response_id = ?",
+                (response_id,),
+            ).fetchone()
+        if not row or (model and row[0] and row[0] != model):
+            return {}
+        return json.loads(row[1])
+
+    def save_agent_session(
+        self,
+        model: str,
+        upstream_state: dict,
+        messages: list,
+        call_ids: list = None,
+    ):
+        call_ids = list(dict.fromkeys(call_ids or tool_call_ids(messages)))
+        if not call_ids or not upstream_state:
+            return
+        self._init()
+        now = int(time.time())
+        encoded_state = json.dumps(upstream_state, ensure_ascii=False)
+        encoded_messages = json.dumps(messages or [], ensure_ascii=False)
+        with self._lock:
+            with self._connection() as con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO agent_sessions "
+                    "(call_id, updated_at, model, upstream_json, messages_json) VALUES (?, ?, ?, ?, ?)",
+                    [(call_id, now, model or "", encoded_state, encoded_messages) for call_id in call_ids],
+                )
+                self._prune(con)
+
+    def find_agent_session(self, model: str, messages: list) -> dict:
+        call_ids = tool_call_ids(messages)
+        if not call_ids:
+            return {}
+        self._init()
+        placeholders = ",".join("?" for _ in call_ids)
+        with self._connection() as con:
+            row = con.execute(
+                f"SELECT upstream_json, messages_json FROM agent_sessions "
+                f"WHERE call_id IN ({placeholders}) AND model = ? ORDER BY updated_at DESC LIMIT 1",
+                tuple(call_ids) + (model or "",),
+            ).fetchone()
+        if not row:
+            return {}
+        known_messages = json.loads(row[1])
+        delta = incremental_messages(messages, known_messages)
+        if not delta:
+            return {}
+        return {
+            "upstream_state": json.loads(row[0]),
+            "known_messages": known_messages,
+            "delta_messages": delta,
+        }
 
 
 def response_call_to_tool_call(item: dict, fallback_index: int = 0) -> dict:

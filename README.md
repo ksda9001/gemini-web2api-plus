@@ -25,7 +25,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 
 ```bash
 pip install httpx
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Server starts at `http://localhost:8081/v1`.
@@ -119,6 +119,8 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 Agent compatibility includes:
 - automatic tool-call repair retry when the model describes an action instead of calling a tool
 - SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
+- SQLite-backed Gemini Web `conversation_id` / `response_id` / `choice_id` state for true upstream agent-session reuse
+- agent instructions and compact tool schemas sent only on the first upstream turn; later turns send only new tool results or user messages
 - deterministic truncation/compaction of long tool outputs and old history
 - Anthropic `thinking` / `redacted_thinking` preservation in prompt context
 
@@ -126,7 +128,9 @@ Agent compatibility includes:
 
 Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`) default `google_stream_auto_tools` to `false`. Many chat UIs, including Open WebUI/NewAPI-style integrations, may send `tools` plus `functionCallingConfig.mode=AUTO` even for ordinary chat. Injecting those tool schemas into the Gemini Web prompt can make the prompt very large and cause empty or truncated replies, so the default treats that specific stream AUTO case as plain streaming chat.
 
-This does not disable agent clients. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; those endpoints keep tool calling, repair retries, SQLite-backed `previous_response_id` state, and multi-step execution. Non-streaming Google native `generateContent` also keeps function calling. Set `google_stream_auto_tools` to `true` only if you intentionally need Google native streaming AUTO function calling and accept the higher prompt-bloat/truncation risk.
+Tool-free OpenAI, Responses, and Anthropic requests no longer receive the Agent behavior instruction either. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`. When those clients actually provide tools, the first turn establishes the complete tool environment; later turns continue through the Gemini Web upstream session stored in SQLite without resending the Agent instruction, full history, or tool schemas. If an upstream session expires or becomes invalid, the service automatically rebuilds it from compacted full history instead of losing context.
+
+Clients may still include `tools` in every HTTP request as required by the Codex, Claude, or Copilot protocol. On a successful continuation this service prevents those repeated definitions from entering the Gemini Web prompt, so they do not consume repeated upstream prompt tokens. Non-streaming Google native `generateContent` still keeps function calling. Set `google_stream_auto_tools` to `true` only when Google native streaming AUTO function calling is explicitly required.
 
 ## Available Models
 
@@ -154,7 +158,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### How to get cookies
@@ -228,6 +232,7 @@ Create `config.json` in the same directory:
   "google_stream_auto_tools": false,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
+  "reuse_upstream_sessions": true,
   "tool_retry_attempts": 1
 }
 ```
@@ -243,6 +248,7 @@ Agent-related config:
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
+- `reuse_upstream_sessions`: reuse the real Gemini Web conversation through SQLite; keep `true` to avoid resending agent instructions, tool schemas, and full history on every turn, or set `false` to restore stateless replay
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
@@ -278,7 +284,7 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **Method 2: config.json**
@@ -289,7 +295,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.

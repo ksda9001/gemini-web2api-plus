@@ -16,7 +16,7 @@ from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
 from gemini_web2api.agent import ResponseStore
 from gemini_web2api.config import CONFIG
-from gemini_web2api.tools import parse_tool_calls, strip_tool_call_protocol
+from gemini_web2api.tools import messages_to_prompt, parse_tool_calls, strip_tool_call_protocol
 
 
 TOOLS = [{
@@ -61,8 +61,10 @@ class HttpHarness:
         self._responses = iter(responses)
         self._original_generate = server.generate
         self._original_generate_stream = server.generate_stream
+        self._original_generate_with_state = server.generate_with_state
         server.generate = self._fake_generate
         server.generate_stream = self._fake_generate_stream
+        server.generate_with_state = self._fake_generate_with_state
         server.RESPONSE_STORE = None
         CONFIG.update({
             "api_keys": [],
@@ -89,6 +91,15 @@ class HttpHarness:
     def _fake_generate_stream(self, prompt, *args, **kwargs):
         self.prompts.append(prompt)
         yield next(self._responses)
+
+    def _fake_generate_with_state(self, prompt, *args, **kwargs):
+        self.prompts.append(prompt)
+        index = len(self.prompts)
+        return next(self._responses), {
+            "conversation_id": "c_test",
+            "response_id": f"r_{index}",
+            "choice_id": f"rc_{index}",
+        }
 
     def post(self, path, payload):
         req = urllib.request.Request(
@@ -130,6 +141,7 @@ class HttpHarness:
         self.httpd.server_close()
         server.generate = self._original_generate
         server.generate_stream = self._original_generate_stream
+        server.generate_with_state = self._original_generate_with_state
         server.RESPONSE_STORE = None
 
 
@@ -192,6 +204,21 @@ class AgentCompatTests(unittest.TestCase):
         ])
         self.assertEqual(extract_response_text(raw), "第一段。\n第二段。\n第三段。")
 
+    def test_plain_chat_prompt_does_not_include_agent_or_tool_instructions(self):
+        prompt, _ = messages_to_prompt([{"role": "user", "content": "普通聊天"}])
+        self.assertEqual(prompt, "普通聊天")
+        self.assertNotIn("Agent behavior", prompt)
+        self.assertNotIn("# Tool Use", prompt)
+
+    def test_agent_prompt_uses_compact_tool_schema(self):
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": "运行 pwd"}], TOOLS, "auto"
+        )
+        self.assertIn("Agent behavior", prompt)
+        self.assertIn("# Tool Use", prompt)
+        self.assertIn('"name":"shell_command"', prompt)
+        self.assertNotIn('"name": "shell_command"', prompt)
+
     def test_extract_response_text_uses_cumulative_segments_without_duplication(self):
         raw = "\n".join([
             make_wrb_line("第一段。"),
@@ -210,8 +237,8 @@ class AgentCompatTests(unittest.TestCase):
 
     def test_generate_continues_truncated_output_without_duplicate_overlap(self):
         responses = iter([
-            ("```html\n<body>mars", True),
-            ("mars</body>\n```", False),
+            ("```html\n<body>mars", True, {"conversation_id": "c1", "response_id": "r1", "choice_id": "rc1"}),
+            ("mars</body>\n```", False, {"conversation_id": "c1", "response_id": "r2", "choice_id": "rc2"}),
         ])
         previous_attempts = CONFIG.get("continuation_attempts")
         CONFIG["continuation_attempts"] = 2
@@ -224,8 +251,8 @@ class AgentCompatTests(unittest.TestCase):
 
     def test_generate_retries_empty_upstream_response(self):
         responses = iter([
-            ("", False),
-            ("complete", False),
+            ("", False, {}),
+            ("complete", False, {"conversation_id": "c1", "response_id": "r1", "choice_id": "rc1"}),
         ])
         previous_attempts = CONFIG.get("retry_attempts")
         previous_delay = CONFIG.get("retry_delay_sec")
@@ -337,6 +364,32 @@ class AgentCompatTests(unittest.TestCase):
                 row = con.execute("SELECT output_json FROM responses WHERE id = ?", ("resp_one",)).fetchone()
             saved_output = json.loads(row[0])
             self.assertEqual(saved_output[0]["name"], "shell_command")
+
+    def test_response_store_persists_upstream_and_agent_sessions(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            store = ResponseStore(str(Path(tmpdir) / "responses.db"))
+            state = {"conversation_id": "c1", "response_id": "r1", "choice_id": "rc1"}
+            store.save_upstream_session("resp_one", "gemini-3.5-flash", state)
+            self.assertEqual(store.get_upstream_session("resp_one", "gemini-3.5-flash"), state)
+
+            messages = [
+                {"role": "user", "content": "run pwd"},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_one",
+                    "type": "function",
+                    "function": {"name": "shell_command", "arguments": '{"command":"pwd"}'},
+                }]},
+            ]
+            store.save_agent_session("gemini-3.5-flash", state, messages)
+            continued = messages + [{
+                "role": "tool",
+                "tool_call_id": "call_one",
+                "name": "shell_command",
+                "content": "/workspace",
+            }]
+            session = store.find_agent_session("gemini-3.5-flash", continued)
+            self.assertEqual(session["upstream_state"], state)
+            self.assertEqual(session["delta_messages"], [continued[-1]])
 
     def test_response_store_links_previous_response_and_truncates_tool_output(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -659,6 +712,41 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 harness.close()
 
+    def test_chat_completions_reuses_upstream_agent_session(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"shell_command","arguments":{"command":"pwd"}}',
+                "Done after reading the tool result.",
+            ])
+            try:
+                first = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "run pwd"}],
+                    "tools": TOOLS,
+                })
+                assistant = first["choices"][0]["message"]
+                second = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [
+                        {"role": "user", "content": "run pwd"},
+                        assistant,
+                        {
+                            "role": "tool",
+                            "tool_call_id": assistant["tool_calls"][0]["id"],
+                            "name": "shell_command",
+                            "content": "/workspace",
+                        },
+                    ],
+                    "tools": TOOLS,
+                })
+                self.assertEqual(second["choices"][0]["finish_reason"], "stop")
+                self.assertEqual(len(harness.prompts), 2)
+                self.assertEqual(harness.prompts[1], "[Tool result for shell_command]: /workspace")
+                self.assertNotIn("Agent behavior", harness.prompts[1])
+                self.assertNotIn("Available tools", harness.prompts[1])
+            finally:
+                harness.close()
+
     def test_chat_completions_accepts_legacy_functions_for_copilot(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [
@@ -831,8 +919,10 @@ class AgentCompatTests(unittest.TestCase):
                 })
                 self.assertEqual(second["previous_response_id"], first["id"])
                 self.assertEqual(second["output"][0]["type"], "function_call")
-                self.assertIn("创建 test.txt", harness.prompts[1])
-                self.assertIn("New-Item", harness.prompts[1])
+                self.assertNotIn("创建 test.txt", harness.prompts[1])
+                self.assertNotIn("New-Item", harness.prompts[1])
+                self.assertNotIn("Agent behavior", harness.prompts[1])
+                self.assertNotIn("Available tools", harness.prompts[1])
                 self.assertIn("truncated", harness.prompts[1])
                 self.assertIn("TAIL", harness.prompts[1])
             finally:
@@ -943,6 +1033,48 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(block["name"], "shell_command")
                 message_delta = next(e["data"] for e in events if e["event"] == "message_delta")
                 self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+            finally:
+                harness.close()
+
+    def test_anthropic_reuses_upstream_agent_session(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"shell_command","arguments":{"command":"pwd"}}',
+                "Done after reading the tool result.",
+            ])
+            try:
+                first = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "run pwd"}],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                })
+                tool_use = first["content"][0]
+                second = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [
+                        {"role": "user", "content": "run pwd"},
+                        {"role": "assistant", "content": [tool_use]},
+                        {"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": "/workspace",
+                        }]},
+                    ],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                })
+                self.assertEqual(second["stop_reason"], "end_turn")
+                self.assertEqual(len(harness.prompts), 2)
+                self.assertIn("/workspace", harness.prompts[1])
+                self.assertNotIn("Agent behavior", harness.prompts[1])
+                self.assertNotIn("Available tools", harness.prompts[1])
             finally:
                 harness.close()
 

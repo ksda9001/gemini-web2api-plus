@@ -105,7 +105,14 @@ def _build_headers() -> dict:
     return headers
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def _build_payload(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+    conversation: dict = None,
+) -> str:
     inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -113,7 +120,13 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
-    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    conversation = conversation or {}
+    inner[2] = [
+        conversation.get("conversation_id", ""),
+        conversation.get("response_id", ""),
+        conversation.get("choice_id", ""),
+        None, None, None, None, None, None, "",
+    ]
     inner[6] = [0]
     inner[7] = 1
     inner[10] = 1
@@ -172,6 +185,34 @@ def _raise_for_bard_error(raw: str):
 
 def _was_truncated(raw: str) -> bool:
     return any(code in TRUNCATION_ERROR_CODES for code in _bard_error_codes(raw))
+
+
+def _extract_conversation_state(raw: str) -> dict:
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line:
+            continue
+        try:
+            outer = json.loads(line)
+            inner_str = outer[0][2]
+            inner = json.loads(inner_str) if inner_str else None
+            ids = inner[1] if isinstance(inner, list) and len(inner) > 4 else None
+            candidates = inner[4] if isinstance(inner, list) and len(inner) > 4 else None
+            choice_id = candidates[0][0] if candidates and isinstance(candidates[0], list) else None
+            if (
+                isinstance(ids, list)
+                and len(ids) >= 2
+                and all(isinstance(value, str) and value for value in ids[:2])
+                and isinstance(choice_id, str)
+                and choice_id
+            ):
+                return {
+                    "conversation_id": ids[0],
+                    "response_id": ids[1],
+                    "choice_id": choice_id,
+                }
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+    return {}
 
 
 def _extract_texts_from_line(line: str) -> list:
@@ -251,8 +292,17 @@ def _append_continuation(partial: str, continuation: str) -> str:
     return partial + continuation
 
 
-def _request_text(prompt: str, model_id: int, think_mode: int, file_refs=None, extra_fields=None) -> tuple:
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+def _request_text(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs=None,
+    extra_fields=None,
+    conversation: dict = None,
+) -> tuple:
+    body = _build_payload(
+        prompt, model_id, think_mode, file_refs, extra_fields, conversation
+    ).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
@@ -267,20 +317,42 @@ def _request_text(prompt: str, model_id: int, think_mode: int, file_refs=None, e
     else:
         resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
     raw = resp.read().decode("utf-8", errors="replace")
-    return extract_response_text(raw), _was_truncated(raw)
+    return extract_response_text(raw), _was_truncated(raw), _extract_conversation_state(raw)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+def generate_with_state(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+    conversation: dict = None,
+    fallback_prompt: str = None,
+) -> tuple:
+    """Generate text and return Gemini Web conversation state for the next turn."""
     last_err = None
+    active_conversation = conversation
+    active_prompt = prompt
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            text, truncated = _request_text(prompt, model_id, think_mode, file_refs, extra_fields)
+            text, truncated, state = _request_text(
+                active_prompt,
+                model_id,
+                think_mode,
+                file_refs,
+                extra_fields,
+                active_conversation,
+            )
             if not text:
                 raise RuntimeError("Gemini upstream returned an empty response")
             break
         except Exception as e:
             last_err = e
+            if active_conversation and fallback_prompt:
+                log(f"Gemini conversation resume failed; rebuilding context: {e}")
+                active_conversation = None
+                active_prompt = fallback_prompt
+                continue
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
@@ -295,8 +367,13 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         continuation = ""
         for attempt in range(CONFIG["retry_attempts"]):
             try:
-                continuation, truncated = _request_text(
-                    continuation_prompt, model_id, think_mode, file_refs, extra_fields
+                continuation, truncated, continuation_state = _request_text(
+                    continuation_prompt,
+                    model_id,
+                    think_mode,
+                    file_refs,
+                    extra_fields,
+                    state,
                 )
                 if not continuation:
                     raise RuntimeError("Gemini continuation returned an empty response")
@@ -309,8 +386,22 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         if not continuation:
             raise last_err
         text = _append_continuation(text, continuation)
+        if continuation_state:
+            state = continuation_state
     if truncated:
         log("Warning: continuation limit reached while upstream still reports truncation")
+    return text, state
+
+
+def generate(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+) -> str:
+    """Non-streaming generation with retry."""
+    text, _ = generate_with_state(prompt, model_id, think_mode, file_refs, extra_fields)
     return text
 
 

@@ -10,7 +10,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, generate_with_state, log
 from .tools import (
     build_google_tool_retry_prompt,
     google_contents_to_messages,
@@ -34,6 +34,7 @@ from .agent import (
     response_messages_from_output,
     sanitize_model_text,
     should_retry_tool_call,
+    tool_call_ids,
     truncate_tool_output,
 )
 from . import __version__
@@ -141,6 +142,72 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         return next(self._iter_with_sse_heartbeats(one_result()))
 
+    def _prepare_agent_turn(self, messages: list, tools: list, tool_choice, model_name: str):
+        full_prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        session = (
+            _response_store().find_agent_session(model_name, messages)
+            if tools and CONFIG.get("reuse_upstream_sessions", True)
+            else {}
+        )
+        if session:
+            delta_prompt, _ = messages_to_prompt(
+                session["delta_messages"],
+                None,
+                "none",
+                include_agent_instruction=False,
+            )
+            if delta_prompt.strip():
+                return delta_prompt, full_prompt, images, session["upstream_state"], True
+        return full_prompt, full_prompt, images, None, False
+
+    def _generate_agent_turn(
+        self,
+        prompt: str,
+        fallback_prompt: str,
+        model_id: int,
+        think_mode: int,
+        images: list,
+        extra_fields: dict,
+        upstream_state: dict,
+        stream_started: bool,
+    ):
+        file_refs = _upload_images(images)
+        callback = lambda: generate_with_state(
+            prompt,
+            model_id,
+            think_mode,
+            file_refs,
+            extra_fields,
+            upstream_state,
+            fallback_prompt,
+        )
+        return self._run_with_sse_heartbeats(callback) if stream_started else callback()
+
+    def _save_agent_turn(
+        self,
+        model_name: str,
+        upstream_state: dict,
+        input_messages: list,
+        assistant_message: dict,
+        fallback_used: bool = False,
+    ):
+        aliases = tool_call_ids(list(input_messages or []) + [assistant_message])
+        if (
+            not CONFIG.get("reuse_upstream_sessions", True)
+            or not aliases
+            or not upstream_state
+        ):
+            return
+        known_messages = list(input_messages or [])
+        if not fallback_used:
+            known_messages.append(assistant_message)
+        _response_store().save_agent_session(
+            model_name,
+            upstream_state,
+            known_messages,
+            aliases,
+        )
+
     def _parse_body(self, body: bytes) -> dict:
         try:
             return json.loads(body)
@@ -242,7 +309,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             CONFIG.get("max_history_chars", 60000),
             CONFIG.get("max_tool_output_chars", 12000),
         )
-        prompt, images = messages_to_prompt(chat_messages, tools, tool_choice)
+        if tools and tool_choice != "none":
+            prompt, fallback_prompt, images, upstream_state, resumed = self._prepare_agent_turn(
+                chat_messages, tools, tool_choice, model_name
+            )
+        else:
+            prompt, images = messages_to_prompt(chat_messages, None, "none")
+            fallback_prompt, upstream_state, resumed = prompt, None, False
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -278,8 +351,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._start_sse()
             stream_started = True
         try:
-            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
-            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
+            text, upstream_state = self._generate_agent_turn(
+                prompt,
+                fallback_prompt,
+                model_id,
+                think_mode,
+                images,
+                extra_fields,
+                upstream_state,
+                stream_started,
+            )
         except Exception as e:
             if stream_started:
                 error = {"error": {"message": f"upstream error: {e}"}}
@@ -291,6 +372,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        fallback_used = False
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
@@ -298,10 +380,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    callback = lambda: generate(
-                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    retry_fallback = build_tool_retry_prompt(fallback_prompt, tool_choice)
+                    retry_text, upstream_state = self._generate_agent_turn(
+                        build_tool_retry_prompt("", tool_choice),
+                        retry_fallback,
+                        model_id,
+                        think_mode,
+                        images,
+                        extra_fields,
+                        upstream_state,
+                        stream_started,
                     )
-                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -312,9 +401,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tool_calls = fallback_tool_call(chat_messages, tools, tool_choice)
             if tool_calls:
                 text = ""
+                fallback_used = True
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        if tools and tool_choice != "none":
+            self._save_agent_turn(
+                model_name,
+                upstream_state,
+                chat_messages,
+                msg,
+                fallback_used,
+            )
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
@@ -520,7 +618,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        fallback_prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        upstream_state = (
+            _response_store().get_upstream_session(previous_response_id, model_name)
+            if CONFIG.get("reuse_upstream_sessions", True)
+            else {}
+        )
+        if upstream_state:
+            prompt, _ = messages_to_prompt(
+                current_messages,
+                None,
+                "none",
+                include_agent_instruction=False,
+            )
+        elif tools and tool_choice != "none":
+            prompt, fallback_prompt, images, upstream_state, _ = self._prepare_agent_turn(
+                messages, tools, tool_choice, model_name
+            )
+        else:
+            prompt = fallback_prompt
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
@@ -529,8 +645,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream_started:
             self._start_sse()
         try:
-            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
-            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
+            text, upstream_state = self._generate_agent_turn(
+                prompt,
+                fallback_prompt,
+                model_id,
+                think_mode,
+                images,
+                extra_fields,
+                upstream_state,
+                stream_started,
+            )
         except Exception as e:
             if stream_started:
                 self._write_sse("error", {"type": "error", "message": f"upstream error: {e}"})
@@ -539,17 +663,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        fallback_used = False
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    callback = lambda: generate(
-                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    retry_text, upstream_state = self._generate_agent_turn(
+                        build_tool_retry_prompt("", tool_choice),
+                        build_tool_retry_prompt(fallback_prompt, tool_choice),
+                        model_id,
+                        think_mode,
+                        images,
+                        extra_fields,
+                        upstream_state,
+                        stream_started,
                     )
-                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -560,6 +690,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tool_calls = fallback_tool_call(messages, tools, tool_choice)
             if tool_calls:
                 text = ""
+                fallback_used = True
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -579,6 +710,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             resp_obj["previous_response_id"] = previous_response_id
         if req.get("store", True) is not False:
             self._store_response_history(resp_obj, messages, output, previous_response_id)
+        if CONFIG.get("reuse_upstream_sessions", True):
+            _response_store().save_upstream_session(rid, model_name, upstream_state)
+        assistant_messages = response_messages_from_output(output)
+        if tools and assistant_messages:
+            self._save_agent_turn(
+                model_name,
+                upstream_state,
+                messages,
+                assistant_messages[-1],
+                fallback_used,
+            )
 
         if req.get("stream"):
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
@@ -649,6 +791,30 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if tool_calls:
                     converted["tool_calls"] = tool_calls
                 messages.append(converted)
+            elif role == "user" and isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            ):
+                user_text = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        result = block.get("content", "")
+                        if not isinstance(result, str):
+                            result = json.dumps(result, ensure_ascii=False)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "name": block.get("name", "") or block.get("tool_use_id", ""),
+                            "content": truncate_tool_output(
+                                result, CONFIG.get("max_tool_output_chars", 12000)
+                            ),
+                        })
+                    elif block.get("type") == "text" and block.get("text"):
+                        user_text.append(block["text"])
+                if user_text:
+                    messages.append({"role": "user", "content": "\n".join(user_text)})
             else:
                 messages.append({"role": role, "content": self._anthropic_content_to_text(content)})
         return messages
@@ -729,7 +895,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tools = self._anthropic_tools_to_openai(req.get("tools", []))
         tool_choice = self._anthropic_tool_choice_to_openai(req.get("tool_choice", "auto"))
         anthropic_messages = self._anthropic_to_openai_messages(req)
-        prompt, images = messages_to_prompt(anthropic_messages, tools, tool_choice)
+        if tools and tool_choice != "none":
+            prompt, fallback_prompt, images, upstream_state, _ = self._prepare_agent_turn(
+                anthropic_messages, tools, tool_choice, model_name
+            )
+        else:
+            prompt, images = messages_to_prompt(anthropic_messages, None, "none")
+            fallback_prompt, upstream_state = prompt, None
         if not prompt.strip():
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
@@ -738,8 +910,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream_started:
             self._start_sse()
         try:
-            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
-            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
+            text, upstream_state = self._generate_agent_turn(
+                prompt,
+                fallback_prompt,
+                model_id,
+                think_mode,
+                images,
+                extra_fields,
+                upstream_state,
+                stream_started,
+            )
         except Exception as e:
             error = {"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}
             if stream_started:
@@ -749,17 +929,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
+        fallback_used = False
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    callback = lambda: generate(
-                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    retry_text, upstream_state = self._generate_agent_turn(
+                        build_tool_retry_prompt("", tool_choice),
+                        build_tool_retry_prompt(fallback_prompt, tool_choice),
+                        model_id,
+                        think_mode,
+                        images,
+                        extra_fields,
+                        upstream_state,
+                        stream_started,
                     )
-                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -770,6 +956,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tool_calls = fallback_tool_call(anthropic_messages, tools, tool_choice)
             if tool_calls:
                 text = ""
+                fallback_used = True
         usage = _usage(prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         if tool_calls:
@@ -778,6 +965,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         else:
             content = [{"type": "text", "text": text or ""}]
             stop_reason = "end_turn"
+
+        assistant_message = {"role": "assistant", "content": text or None}
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        if tools and tool_choice != "none":
+            self._save_agent_turn(
+                model_name,
+                upstream_state,
+                anthropic_messages,
+                assistant_message,
+                fallback_used,
+            )
 
         if req.get("stream"):
             if tool_calls:
