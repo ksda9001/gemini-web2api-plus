@@ -391,18 +391,25 @@ def extract_response_text(raw: str) -> str:
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
 AGENT_BEHAVIOR_INSTRUCTION = (
-    "Agent behavior:\n"
-    "- If the user asks to create, edit, read, delete, list, move, or inspect files; "
-    "run commands; install dependencies; execute tests; open URLs; or otherwise act on the local environment, "
-    "call the appropriate tool instead of describing what you would do.\n"
-    "- When the user asks to generate or create a file, write the file through tools. "
-    "Do not merely print the file contents in a normal text answer unless the user explicitly asks to only see the contents.\n"
-    "- Work step by step. After receiving a tool result, decide whether another tool call is needed and continue "
-    "until the user's task is complete.\n"
-    "- Do not finish with a text answer while required file edits, commands, tests, or inspections remain undone.\n"
-    "- Use the same natural language as the user's latest request for final answers and user-facing status text. "
-    "Keep tool names, file paths, commands, and JSON arguments in their required syntax.\n"
+    "Agent mode: Act with supplied tools when the task requires environment work. Continue after each result "
+    "until complete; never replace pending actions with descriptions."
 )
+
+
+def _has_tool_history(messages: list) -> bool:
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" or message.get("tool_calls"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict)
+            and item.get("type") in ("function_call", "tool_use", "tool_result")
+            for item in content
+        ):
+            return True
+    return False
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
@@ -452,9 +459,11 @@ def openai_tool_choice_from_request(req: dict):
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> str:
     """Convert OpenAI messages to prompt string."""
     parts = []
-    parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
+    agent_tools = bool(tools) and tool_choice != "none"
+    if agent_tools and not _has_tool_history(messages):
+        parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
 
-    if tools and tool_choice != "none":
+    if agent_tools:
         tool_defs = []
         for tool in tools:
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
@@ -465,12 +474,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             })
         if tool_defs:
             parts.append(
-                "[System instruction]: You have access to tools. "
-                "To call a tool, respond with:\n"
+                "# Tool Use\n\n"
+                "Use tools for required environment actions and continue after each result until done. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
-                "Only use tool_call blocks or raw JSON tool call objects when needed.\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                "When calling tools, output ONLY the tool_call block(s) or raw JSON tool call object(s).\n\n"
+                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':'))}"
                 f"{_build_tool_choice_instruction(tool_choice, tool_defs)}"
             )
     for msg in messages:

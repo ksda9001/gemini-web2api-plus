@@ -109,18 +109,19 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 Agent 兼容能力包括:
 - 当模型只描述动作而没有调用工具时, 自动进行一次工具调用修复重试
 - 使用 SQLite 保存 Responses 历史, 支持 `previous_response_id` 和 `GET /v1/responses/{id}`
-- 使用 SQLite 保存 Gemini Web 的 `conversation_id` / `response_id` / `choice_id`, 让多步 agent 复用真实上游会话
-- Agent 指令和紧凑工具 schema 仅在上游会话首轮发送；后续只发送新增工具结果或用户消息
+- 实验性保存 Gemini Web 的 `conversation_id` / `response_id` / `choice_id`，但仅在账号支持上游续接时启用
+- 完整 Agent 行为指令只在工具链首轮发送；无状态后续轮使用紧凑 JSON 工具 schema
 - 对超长工具输出和旧历史做确定性截断/压缩
 - 在 prompt 上下文中保留 Anthropic `thinking` / `redacted_thinking` 信息
+- 已测试 Codex Responses、Claude Messages、Copilot/OpenAI Chat Completions 的多步工具循环
 
 ### 聊天与 Agent 工具调用
 
 Google 原生流式接口 (`/v1beta/models/{model}:streamGenerateContent`) 默认将 `google_stream_auto_tools` 设为 `false`. Open WebUI/NewAPI 这类聊天集成有时会在普通聊天里也发送 `tools` 和 `functionCallingConfig.mode=AUTO`. 如果把这些工具 schema 注入 Gemini Web prompt, prompt 会明显膨胀, 容易触发空回复或截断, 所以默认会把这个特定的 stream AUTO 场景当作普通流式聊天处理.
 
-没有工具的 OpenAI/Responses/Anthropic 请求也不会再注入 Agent behavior 指令。Codex 走 `/v1/responses`, Claude Code 走 `/v1/messages`, Copilot/OpenAI 兼容 agent 走 `/v1/chat/completions`; 当这些客户端确实发送工具时, 首轮仍会建立完整工具能力，后续轮则通过 SQLite 保存的 Gemini Web 上游会话继续执行，不重复发送 Agent 指令、完整历史和工具 schema。如果上游会话过期或失效，服务会自动使用压缩后的完整历史重建，不会直接丢失上下文。
+没有工具的 OpenAI/Responses/Anthropic 请求不会注入 Agent behavior 指令。Codex 走 `/v1/responses`, Claude Code 走 `/v1/messages`, Copilot/OpenAI 兼容 agent 走 `/v1/chat/completions`；这些客户端发送工具时仍保留完整 agent 能力。Agent 工具链中，完整 Agent 行为指令只会在第一次工具调用前注入；请求历史已经包含工具调用或工具结果时，后续轮不再重复该指令。
 
-客户端可能仍会在每个 HTTP 请求里携带 `tools`，这是 Codex/Claude/Copilot 的协议行为；本服务会在续接成功时阻止这些重复定义再次进入 Gemini Web prompt，所以不会重复消耗对应的上游 prompt token。非流式 Google 原生 `generateContent` 仍保留 function calling。只有在明确需要 Google 原生流式 AUTO 工具调用时，才建议把 `google_stream_auto_tools` 改成 `true`。
+客户端通常会在每个 HTTP 请求里携带 `tools`，这是 Codex/Claude/Copilot 和无状态模型 API 的正常行为，不是异常浪费。当前 Gemini Web 账号对所有已配置模型的上游会话续接会返回 `BardErrorInfo 1096/1097`，所以模型每轮仍必须看到紧凑工具 schema，才能可靠地产生合法参数。如果某个账号通过真实续接测试并启用 `reuse_upstream_sessions`，后续轮才只发送新增消息或工具结果。SQLite 会保存 Responses 历史并关联工具步骤，但实际执行每个工具、继续循环直到最终回复的仍是接入的 agent 客户端。
 
 ## 可用模型
 
@@ -222,7 +223,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "google_stream_auto_tools": false,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
-  "reuse_upstream_sessions": true,
+  "reuse_upstream_sessions": false,
   "tool_retry_attempts": 1
 }
 ```
@@ -238,7 +239,7 @@ Agent 相关配置:
 - `google_stream_auto_tools`: 保持 `false` 可优先保证 Open WebUI/NewAPI 这类流式聊天稳定；只有需要 Google 原生流式 AUTO 工具调用时才设为 `true`
 - `continuation_attempts`: Gemini Web 明确返回输出上限标记 (`BardErrorInfo 1155`) 时，自动从断点续写的最大轮数
 - `sse_heartbeat_sec`: 等待 Gemini 首段或 agent 工具决策期间发送 SSE 注释心跳的间隔，避免 NewAPI、Open WebUI 或反向代理把仍在工作的请求当成断连
-- `reuse_upstream_sessions`: 使用 SQLite 复用 Gemini Web 的真实上游会话；保持 `true` 可避免每轮重发 Agent 指令、工具 schema 和完整历史，设为 `false` 可回退到旧的无状态重放模式
+- `reuse_upstream_sessions`: 实验性 Gemini Web 上游会话续接。默认 `false`；当前账号会返回 1096/1097，启用只会增加一次失败请求。仅在经过真实两轮验证的账号上设为 `true`
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
@@ -248,8 +249,13 @@ Agent 相关配置:
 ```bash
 cp config.example.json config.json
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run -d --name gemini-web2api -p 8081:8081 \
+  -v ./config.json:/app/config.json \
+  -v gemini-web2api-data:/app/data \
+  gemini-web2api
 ```
+
+Podman 使用同样的命名 volume 即可。如果没有持久化挂载 `/app/data`，删除并重建容器时 SQLite 历史可能丢失。
 
 或使用 Docker Compose:
 

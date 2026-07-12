@@ -8,18 +8,26 @@ import io
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
 AGENT_BEHAVIOR_INSTRUCTION = (
-    "Agent behavior:\n"
-    "- If the user asks to create, edit, read, delete, list, move, or inspect files; "
-    "run commands; install dependencies; execute tests; open URLs; or otherwise act on the local environment, "
-    "call the appropriate tool instead of describing what you would do.\n"
-    "- When the user asks to generate or create a file, write the file through tools. "
-    "Do not merely print the file contents in a normal text answer unless the user explicitly asks to only see the contents.\n"
-    "- Work step by step. After receiving a tool result, decide whether another tool call is needed and continue "
-    "until the user's task is complete.\n"
-    "- Do not finish with a text answer while required file edits, commands, tests, or inspections remain undone.\n"
-    "- Use the same natural language as the user's latest request for final answers and user-facing status text. "
-    "Keep tool names, file paths, commands, and JSON arguments in their required syntax.\n"
+    "Agent mode: Act with supplied tools when the task requires environment work. Continue after each result "
+    "until complete; never replace pending actions with descriptions."
 )
+
+
+def _has_tool_history(messages: list) -> bool:
+    """Return whether this request is continuing an existing tool loop."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" or message.get("tool_calls"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict)
+            and item.get("type") in ("function_call", "tool_use", "tool_result")
+            for item in content
+        ):
+            return True
+    return False
 
 
 def _compress_b64_if_needed(b64: str) -> str:
@@ -114,7 +122,7 @@ def messages_to_prompt(
 
     agent_tools = bool(tools) and tool_choice != "none"
     if include_agent_instruction is None:
-        include_agent_instruction = agent_tools
+        include_agent_instruction = agent_tools and not _has_tool_history(messages)
     if include_agent_instruction:
         parts.append(f"[System instruction]: {AGENT_BEHAVIOR_INSTRUCTION}")
 
@@ -131,7 +139,7 @@ def messages_to_prompt(
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
                 "# Tool Use\n\n"
-                "You can call the following tools. Call format:\n"
+                "Use tools for required environment actions and continue after each result until done. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
                 "When calling tools, output ONLY the tool_call block(s) or raw JSON tool call object(s).\n\n"

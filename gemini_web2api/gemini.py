@@ -390,7 +390,7 @@ def generate_with_state(
             state = continuation_state
     if truncated:
         log("Warning: continuation limit reached while upstream still reports truncation")
-    return text, state
+    return text, state, active_prompt
 
 
 def generate(
@@ -401,7 +401,7 @@ def generate(
     extra_fields: dict = None,
 ) -> str:
     """Non-streaming generation with retry."""
-    text, _ = generate_with_state(prompt, model_id, think_mode, file_refs, extra_fields)
+    text, _, _ = generate_with_state(prompt, model_id, think_mode, file_refs, extra_fields)
     return text
 
 

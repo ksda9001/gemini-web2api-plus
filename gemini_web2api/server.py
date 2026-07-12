@@ -146,7 +146,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         full_prompt, images = messages_to_prompt(messages, tools, tool_choice)
         session = (
             _response_store().find_agent_session(model_name, messages)
-            if tools and CONFIG.get("reuse_upstream_sessions", True)
+            if tools and CONFIG.get("reuse_upstream_sessions", False)
             else {}
         )
         if session:
@@ -193,7 +193,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
     ):
         aliases = tool_call_ids(list(input_messages or []) + [assistant_message])
         if (
-            not CONFIG.get("reuse_upstream_sessions", True)
+            not CONFIG.get("reuse_upstream_sessions", False)
             or not aliases
             or not upstream_state
         ):
@@ -351,7 +351,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._start_sse()
             stream_started = True
         try:
-            text, upstream_state = self._generate_agent_turn(
+            text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
                 fallback_prompt,
                 model_id,
@@ -381,7 +381,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
                     retry_fallback = build_tool_retry_prompt(fallback_prompt, tool_choice)
-                    retry_text, upstream_state = self._generate_agent_turn(
+                    retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
                         build_tool_retry_prompt("", tool_choice),
                         retry_fallback,
                         model_id,
@@ -391,6 +391,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         upstream_state,
                         stream_started,
                     )
+                    usage_prompt += "\n" + retry_usage_prompt
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -441,8 +442,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
+                "usage": {"prompt_tokens": len(usage_prompt)//4, "completion_tokens": len(text or "")//4,
+                          "total_tokens": (len(usage_prompt)+len(text or ""))//4},
             })
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
@@ -621,7 +622,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         fallback_prompt, images = messages_to_prompt(messages, tools, tool_choice)
         upstream_state = (
             _response_store().get_upstream_session(previous_response_id, model_name)
-            if CONFIG.get("reuse_upstream_sessions", True)
+            if CONFIG.get("reuse_upstream_sessions", False)
             else {}
         )
         if upstream_state:
@@ -645,7 +646,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream_started:
             self._start_sse()
         try:
-            text, upstream_state = self._generate_agent_turn(
+            text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
                 fallback_prompt,
                 model_id,
@@ -670,7 +671,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
-                    retry_text, upstream_state = self._generate_agent_turn(
+                    retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
                         build_tool_retry_prompt("", tool_choice),
                         build_tool_retry_prompt(fallback_prompt, tool_choice),
                         model_id,
@@ -680,6 +681,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         upstream_state,
                         stream_started,
                     )
+                    usage_prompt += "\n" + retry_usage_prompt
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -705,12 +707,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         resp_obj = {"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                     "model": model_name, "output": output,
-                    "usage": self._response_usage(prompt, text)}
+                    "usage": self._response_usage(usage_prompt, text)}
         if previous_response_id:
             resp_obj["previous_response_id"] = previous_response_id
         if req.get("store", True) is not False:
             self._store_response_history(resp_obj, messages, output, previous_response_id)
-        if CONFIG.get("reuse_upstream_sessions", True):
+        if CONFIG.get("reuse_upstream_sessions", False):
             _response_store().save_upstream_session(rid, model_name, upstream_state)
         assistant_messages = response_messages_from_output(output)
         if tools and assistant_messages:
@@ -910,7 +912,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream_started:
             self._start_sse()
         try:
-            text, upstream_state = self._generate_agent_turn(
+            text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
                 fallback_prompt,
                 model_id,
@@ -936,7 +938,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
-                    retry_text, upstream_state = self._generate_agent_turn(
+                    retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
                         build_tool_retry_prompt("", tool_choice),
                         build_tool_retry_prompt(fallback_prompt, tool_choice),
                         model_id,
@@ -946,6 +948,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         upstream_state,
                         stream_started,
                     )
+                    usage_prompt += "\n" + retry_usage_prompt
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -957,7 +960,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if tool_calls:
                 text = ""
                 fallback_used = True
-        usage = _usage(prompt, text or "")
+        usage = _usage(usage_prompt, text or "")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         if tool_calls:
             content = [{"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": self._safe_json_object(tc["function"].get("arguments"))} for tc in tool_calls]

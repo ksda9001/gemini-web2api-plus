@@ -24,6 +24,6 @@
   "google_stream_auto_tools": false,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
-  "reuse_upstream_sessions": true,
+  "reuse_upstream_sessions": false,
   "tool_retry_attempts": 1
 }

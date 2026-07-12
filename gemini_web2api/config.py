@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     "google_stream_auto_tools": False,
     "continuation_attempts": 2,
     "sse_heartbeat_sec": 10,
-    "reuse_upstream_sessions": True,
+    "reuse_upstream_sessions": False,
     "tool_retry_attempts": 1,
 }
 

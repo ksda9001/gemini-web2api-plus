@@ -119,18 +119,19 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 Agent compatibility includes:
 - automatic tool-call repair retry when the model describes an action instead of calling a tool
 - SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
-- SQLite-backed Gemini Web `conversation_id` / `response_id` / `choice_id` state for true upstream agent-session reuse
-- agent instructions and compact tool schemas sent only on the first upstream turn; later turns send only new tool results or user messages
+- experimental Gemini Web `conversation_id` / `response_id` / `choice_id` persistence for accounts that support upstream continuation
+- the full Agent behavior instruction only on the first tool turn, plus compact JSON tool schemas on stateless follow-up turns
 - deterministic truncation/compaction of long tool outputs and old history
 - Anthropic `thinking` / `redacted_thinking` preservation in prompt context
+- tested multi-step loops for Codex Responses, Claude Messages, and Copilot/OpenAI Chat Completions
 
 ### Chat vs Agent Tool Use
 
 Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`) default `google_stream_auto_tools` to `false`. Many chat UIs, including Open WebUI/NewAPI-style integrations, may send `tools` plus `functionCallingConfig.mode=AUTO` even for ordinary chat. Injecting those tool schemas into the Gemini Web prompt can make the prompt very large and cause empty or truncated replies, so the default treats that specific stream AUTO case as plain streaming chat.
 
-Tool-free OpenAI, Responses, and Anthropic requests no longer receive the Agent behavior instruction either. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`. When those clients actually provide tools, the first turn establishes the complete tool environment; later turns continue through the Gemini Web upstream session stored in SQLite without resending the Agent instruction, full history, or tool schemas. If an upstream session expires or becomes invalid, the service automatically rebuilds it from compacted full history instead of losing context.
+Tool-free OpenAI, Responses, and Anthropic requests do not receive the Agent behavior instruction. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; requests that actually provide tools keep complete agent behavior. On an agent request, the full Agent behavior instruction is injected only before the first tool call. Follow-up requests whose history already contains a tool call/result omit that instruction.
 
-Clients may still include `tools` in every HTTP request as required by the Codex, Claude, or Copilot protocol. On a successful continuation this service prevents those repeated definitions from entering the Gemini Web prompt, so they do not consume repeated upstream prompt tokens. Non-streaming Google native `generateContent` still keeps function calling. Set `google_stream_auto_tools` to `true` only when Google native streaming AUTO function calling is explicitly required.
+Clients normally include `tools` in every HTTP request as part of stateless Codex, Claude, and Copilot model protocols. The current Gemini Web account returns `BardErrorInfo 1096/1097` for upstream continuation on every configured model, so the model must still see the compact tool schema on every agent turn to produce reliable arguments. If `reuse_upstream_sessions` is enabled for an account that passes a real continuation test, follow-up turns send only new messages/tool results. SQLite preserves Responses history and links tool steps, but the connected agent client still executes each tool and drives the loop until the model returns a final answer.
 
 ## Available Models
 
@@ -232,7 +233,7 @@ Create `config.json` in the same directory:
   "google_stream_auto_tools": false,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
-  "reuse_upstream_sessions": true,
+  "reuse_upstream_sessions": false,
   "tool_retry_attempts": 1
 }
 ```
@@ -248,7 +249,7 @@ Agent-related config:
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
-- `reuse_upstream_sessions`: reuse the real Gemini Web conversation through SQLite; keep `true` to avoid resending agent instructions, tool schemas, and full history on every turn, or set `false` to restore stateless replay
+- `reuse_upstream_sessions`: experimental Gemini Web continuation, default `false`; this account returns 1096/1097, so enable it only after a real two-turn continuation test succeeds for another account
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
@@ -258,8 +259,13 @@ Streaming endpoints no longer report an empty upstream response as a successful 
 ```bash
 cp config.example.json config.json
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run -d --name gemini-web2api -p 8081:8081 \
+  -v ./config.json:/app/config.json \
+  -v gemini-web2api-data:/app/data \
+  gemini-web2api
 ```
+
+Use the equivalent named volume with Podman. Without a persistent `/app/data` mount, SQLite history can be lost when the container is removed and recreated.
 
 Or use Docker Compose:
 
