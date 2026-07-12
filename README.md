@@ -243,7 +243,8 @@ Create `config.json` in the same directory:
   "webapi_watchdog_sec": 120,
   "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1,
-  "temporary_background_tasks": true
+  "temporary_background_tasks": true,
+  "require_authenticated_webapi": true
 }
 ```
 
@@ -267,6 +268,7 @@ Agent-related config:
 - `webapi_request_timeout_sec`: total wait for non-stream requests and idle wait between streaming deltas; expiration cancels the background task and allows the configured direct fallback
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 - `temporary_background_tasks`: recognize Open WebUI's default title, tags, follow-up, and image-prompt helper requests and send them as Gemini temporary chats, so only the real conversation appears in Gemini Web history
+- `require_authenticated_webapi`: require Gemini account status `AVAILABLE` before using persistent upstream sessions; expired cookies are reported and routed through the configured direct fallback instead of silently creating anonymous conversations
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 

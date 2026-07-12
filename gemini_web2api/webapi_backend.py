@@ -108,6 +108,23 @@ def _start_isolated_chat(client, model, state: dict = None):
     return chat
 
 
+def _account_status_name(client) -> str:
+    status = getattr(client, "account_status", None)
+    return str(getattr(status, "name", status or "UNKNOWN")).upper()
+
+
+def _assert_authenticated(client):
+    """Reject anonymous Gemini sessions when persistent Web history is expected."""
+    if not CONFIG.get("require_authenticated_webapi", True):
+        return
+    status = _account_status_name(client)
+    if status != "AVAILABLE":
+        raise RuntimeError(
+            "Gemini Web account is not authenticated "
+            f"(account_status={status}); refresh the mounted browser cookies"
+        )
+
+
 class GeminiWebAPIBackend:
     """Run the async Gemini web client on one persistent background event loop."""
 
@@ -146,6 +163,7 @@ class GeminiWebAPIBackend:
             and getattr(self._client, "_running", False)
             and fingerprint == self._cookie_fingerprint
         ):
+            _assert_authenticated(self._client)
             return self._client
 
         if self._client is not None:
@@ -171,6 +189,13 @@ class GeminiWebAPIBackend:
             watchdog_timeout=min(timeout, int(CONFIG.get("webapi_watchdog_sec", 120) or 120)),
             verbose=bool(CONFIG.get("log_requests", False)),
         )
+        try:
+            _assert_authenticated(self._client)
+        except Exception:
+            await self._client.close()
+            self._client = None
+            self._cookie_fingerprint = ""
+            raise
         self._cookie_fingerprint = fingerprint
         return self._client
 

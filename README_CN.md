@@ -233,7 +233,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "webapi_watchdog_sec": 120,
   "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1,
-  "temporary_background_tasks": true
+  "temporary_background_tasks": true,
+  "require_authenticated_webapi": true
 }
 ```
 
@@ -257,6 +258,7 @@ Agent 相关配置:
 - `webapi_request_timeout_sec`: 新上游非流式请求的总等待上限，以及流式请求相邻输出之间的闲置上限；超时会取消后台任务并按配置回退 direct
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 - `temporary_background_tasks`: 识别 Open WebUI 默认的标题、标签、后续问题和图片提示词后台请求，并使用 Gemini 临时聊天发送；这些辅助请求仍会正常返回结果，但不会出现在 Gemini 网页历史中，只有真实对话会保留
+- `require_authenticated_webapi`: 使用持久化上游会话前要求 Gemini 账号状态为 `AVAILABLE`；Cookie 过期时会明确记录并走已配置的 direct 回退，不再静默创建无法出现在账号历史中的匿名会话
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
 

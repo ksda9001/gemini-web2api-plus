@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "webapi_request_timeout_sec": 180,
     "tool_retry_attempts": 1,
     "temporary_background_tasks": True,
+    "require_authenticated_webapi": True,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

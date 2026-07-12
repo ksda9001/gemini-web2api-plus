@@ -375,6 +375,32 @@ class AgentCompatTests(unittest.TestCase):
         self.assertEqual(chat.metadata, state["metadata"])
         self.assertIsNot(chat.metadata, state["metadata"])
 
+    def test_webapi_rejects_unauthenticated_session_by_default(self):
+        class Status:
+            name = "UNAUTHENTICATED"
+
+        class FakeClient:
+            account_status = Status()
+
+        previous = CONFIG.get("require_authenticated_webapi")
+        try:
+            CONFIG["require_authenticated_webapi"] = True
+            with self.assertRaisesRegex(RuntimeError, "not authenticated"):
+                webapi_backend._assert_authenticated(FakeClient())
+            CONFIG["require_authenticated_webapi"] = False
+            webapi_backend._assert_authenticated(FakeClient())
+        finally:
+            CONFIG["require_authenticated_webapi"] = previous
+
+    def test_webapi_accepts_available_account(self):
+        class Status:
+            name = "AVAILABLE"
+
+        class FakeClient:
+            account_status = Status()
+
+        webapi_backend._assert_authenticated(FakeClient())
+
     def test_webapi_dependency_imports_client_and_model_when_installed(self):
         try:
             import gemini_webapi
