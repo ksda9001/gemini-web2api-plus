@@ -108,12 +108,12 @@ class GeminiWebAPIBackend:
         secure_1psid = pairs.get("__Secure-1PSID", "")
         secure_1psidts = pairs.get("__Secure-1PSIDTS", "")
         fingerprint = hashlib.sha256(
-            f"{secure_1psid}\0{secure_1psidts}".encode()
+            json.dumps(pairs, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        return secure_1psid, secure_1psidts, fingerprint
+        return pairs, secure_1psid, secure_1psidts, fingerprint
 
     async def _ensure_client(self):
-        secure_1psid, secure_1psidts, fingerprint = self._credentials()
+        pairs, secure_1psid, secure_1psidts, fingerprint = self._credentials()
         if not secure_1psid:
             raise RuntimeError("cookie file does not contain __Secure-1PSID")
         if (
@@ -134,6 +134,9 @@ class GeminiWebAPIBackend:
             secure_1psidts or None,
             proxy=CONFIG.get("proxy"),
         )
+        # Preserve the complete browser session. Some accounts can authenticate
+        # with 1PSID alone, while others still require companion Google cookies.
+        self._client.cookies = pairs
         timeout = int(CONFIG.get("request_timeout_sec", 180) or 180)
         await self._client.init(
             timeout=timeout,

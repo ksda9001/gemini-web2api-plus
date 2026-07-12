@@ -310,6 +310,29 @@ class AgentCompatTests(unittest.TestCase):
         self.assertIs(webapi_backend.GeminiClient, gemini_webapi.GeminiClient)
         self.assertIsNotNone(webapi_backend.Model)
 
+    def test_webapi_credentials_fingerprint_complete_cookie_jar(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cookie_path = Path(tmpdir) / "cookie.txt"
+            previous = CONFIG.get("cookie_file")
+            try:
+                cookie_path.write_text(
+                    "__Secure-1PSID=one; SID=sid-one; SAPISID=sapi-one",
+                    encoding="utf-8",
+                )
+                CONFIG["cookie_file"] = str(cookie_path)
+                pairs, psid, psidts, first_fingerprint = webapi_backend.GeminiWebAPIBackend._credentials()
+                self.assertEqual(psid, "one")
+                self.assertEqual(psidts, "")
+                self.assertEqual(pairs["SID"], "sid-one")
+                cookie_path.write_text(
+                    "__Secure-1PSID=one; SID=sid-two; SAPISID=sapi-one",
+                    encoding="utf-8",
+                )
+                _, _, _, second_fingerprint = webapi_backend.GeminiWebAPIBackend._credentials()
+                self.assertNotEqual(first_fingerprint, second_fingerprint)
+            finally:
+                CONFIG["cookie_file"] = previous
+
     def test_generate_with_state_uses_webapi_session_backend(self):
         previous = {
             key: CONFIG.get(key)
