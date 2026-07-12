@@ -226,6 +226,8 @@ Create `config.json` in the same directory:
   "max_history_chars": 60000,
   "max_google_prompt_chars": 18000,
   "google_stream_auto_tools": false,
+  "continuation_attempts": 2,
+  "sse_heartbeat_sec": 10,
   "tool_retry_attempts": 1
 }
 ```
@@ -239,7 +241,11 @@ Agent-related config:
 - `max_history_messages` / `max_history_chars`: deterministic context compaction limits
 - `max_google_prompt_chars`: hard cap for Google native prompt text sent upstream; older context is trimmed first to reduce empty/truncated responses
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
+- `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
+- `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
+
+Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 
 ## Docker
 

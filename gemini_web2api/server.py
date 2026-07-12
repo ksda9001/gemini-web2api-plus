@@ -1,5 +1,7 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import json
+import queue
+import threading
 import time
 import uuid
 import re
@@ -102,6 +104,42 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _write_sse(self, event: str, data: dict):
         self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
         self.wfile.flush()
+
+    def _write_sse_heartbeat(self):
+        self.wfile.write(b": keep-alive\n\n")
+        self.wfile.flush()
+
+    def _iter_with_sse_heartbeats(self, iterable):
+        results = queue.Queue()
+
+        def consume():
+            try:
+                for item in iterable:
+                    results.put(("item", item))
+                results.put(("done", None))
+            except BaseException as exc:
+                results.put(("error", exc))
+
+        threading.Thread(target=consume, daemon=True).start()
+        heartbeat_sec = max(1, int(CONFIG.get("sse_heartbeat_sec", 10) or 10))
+        while True:
+            try:
+                kind, value = results.get(timeout=heartbeat_sec)
+            except queue.Empty:
+                self._write_sse_heartbeat()
+                continue
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+
+    def _run_with_sse_heartbeats(self, callback):
+        def one_result():
+            yield callback()
+
+        return next(self._iter_with_sse_heartbeats(one_result()))
 
     def _parse_body(self, body: bytes) -> dict:
         try:
@@ -215,7 +253,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
+                deltas = generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                for delta in self._iter_with_sse_heartbeats(deltas):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -227,12 +266,28 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                error = {"error": {"message": f"upstream error: {e}"}}
+                self.wfile.write(f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
             return
 
+        stream_started = False
+        if stream:
+            self._start_sse()
+            stream_started = True
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            if stream_started:
+                error = {"error": {"message": f"upstream error: {e}"}}
+                self.wfile.write(f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            else:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
         tool_calls = None
@@ -243,7 +298,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                    callback = lambda: generate(
+                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    )
+                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -260,7 +318,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
-            self._start_sse()
             if tool_calls:
                 delta = {"role": "assistant", "content": None, "tool_calls": []}
                 for index, tc in enumerate(tool_calls):
@@ -468,10 +525,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        stream_started = bool(req.get("stream"))
+        if stream_started:
+            self._start_sse()
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            if stream_started:
+                self._write_sse("error", {"type": "error", "message": f"upstream error: {e}"})
+            else:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
         tool_calls = None
@@ -482,7 +546,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                    callback = lambda: generate(
+                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    )
+                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -514,7 +581,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._store_response_history(resp_obj, messages, output, previous_response_id)
 
         if req.get("stream"):
-            self._start_sse()
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
             self._write_sse("response.created", ev)
             for output_index, item in enumerate(output):
@@ -668,10 +734,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty input"}}, 400)
             return
 
+        stream_started = bool(req.get("stream"))
+        if stream_started:
+            self._start_sse()
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            callback = lambda: generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
         except Exception as e:
-            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            error = {"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}
+            if stream_started:
+                self._write_sse("error", error)
+            else:
+                self.send_json(error, 502)
             return
 
         tool_calls = None
@@ -682,7 +756,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
                 try:
-                    retry_text = generate(retry_prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                    callback = lambda: generate(
+                        retry_prompt, model_id, think_mode, _upload_images(images), extra_fields
+                    )
+                    retry_text = self._run_with_sse_heartbeats(callback) if stream_started else callback()
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
@@ -703,7 +780,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
             stop_reason = "end_turn"
 
         if req.get("stream"):
-            self._start_sse()
             if tool_calls:
                 self._write_anthropic_stream_tool(message_id, model_name, tool_calls, usage)
             else:
@@ -763,7 +839,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                deltas = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
+                for delta in self._iter_with_sse_heartbeats(deltas):
                     if not delta:
                         continue
                     full_text += delta
@@ -786,6 +863,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                error = {"error": {"message": f"upstream error: {e}"}}
+                self.wfile.write(f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
             return
 
         try:

@@ -9,7 +9,9 @@ import urllib.error
 import urllib.request
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
+import gemini_web2api.gemini as gemini
 from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
 from gemini_web2api.agent import ResponseStore
@@ -197,6 +199,43 @@ class AgentCompatTests(unittest.TestCase):
             make_wrb_line("第一段。\n第二段。\n第三段。"),
         ])
         self.assertEqual(extract_response_text(raw), "第一段。\n第二段。\n第三段。")
+
+    def test_extract_response_text_accepts_1155_partial_output_for_continuation(self):
+        raw = "\n".join([
+            make_wrb_line("partial code"),
+            json.dumps([["wrb.fr", None, json.dumps([None, [["BardErrorInfo", [1155]]]])]]),
+        ])
+        self.assertEqual(extract_response_text(raw), "partial code")
+        self.assertTrue(gemini._was_truncated(raw))
+
+    def test_generate_continues_truncated_output_without_duplicate_overlap(self):
+        responses = iter([
+            ("```html\n<body>mars", True),
+            ("mars</body>\n```", False),
+        ])
+        previous_attempts = CONFIG.get("continuation_attempts")
+        CONFIG["continuation_attempts"] = 2
+        try:
+            with patch.object(gemini, "_request_text", side_effect=lambda *args, **kwargs: next(responses)):
+                text = gemini.generate("build mars", 1, 0)
+        finally:
+            CONFIG["continuation_attempts"] = previous_attempts
+        self.assertEqual(text, "```html\n<body>mars</body>\n```")
+
+    def test_generate_retries_empty_upstream_response(self):
+        responses = iter([
+            ("", False),
+            ("complete", False),
+        ])
+        previous_attempts = CONFIG.get("retry_attempts")
+        previous_delay = CONFIG.get("retry_delay_sec")
+        CONFIG.update({"retry_attempts": 2, "retry_delay_sec": 0})
+        try:
+            with patch.object(gemini, "_request_text", side_effect=lambda *args, **kwargs: next(responses)):
+                text = gemini.generate("hello", 1, 0)
+        finally:
+            CONFIG.update({"retry_attempts": previous_attempts, "retry_delay_sec": previous_delay})
+        self.assertEqual(text, "complete")
 
     def test_single_file_extract_response_text_merges_segments(self):
         module = load_single_file_module()

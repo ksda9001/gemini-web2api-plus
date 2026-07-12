@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     "max_history_chars": 60000,
     "max_google_prompt_chars": 18000,
     "google_stream_auto_tools": False,
+    "continuation_attempts": 2,
+    "sse_heartbeat_sec": 10,
     "tool_retry_attempts": 1,
 }
 

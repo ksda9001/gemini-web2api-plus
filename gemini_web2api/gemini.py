@@ -20,6 +20,7 @@ from .config import CONFIG
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+TRUNCATION_ERROR_CODES = {1155}
 
 
 def log(msg: str):
@@ -156,6 +157,23 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _bard_error_codes(raw: str) -> list:
+    """Extract BardErrorInfo codes from both plain and JSON-encoded frames."""
+    if not raw or "BardErrorInfo" not in raw:
+        return []
+    return [int(code) for code in re.findall(r"BardErrorInfo[^0-9]{0,40}\[(\d+)\]", raw)]
+
+
+def _raise_for_bard_error(raw: str):
+    errors = [code for code in _bard_error_codes(raw) if code not in TRUNCATION_ERROR_CODES]
+    if errors:
+        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{errors[0]}]")
+
+
+def _was_truncated(raw: str) -> bool:
+    return any(code in TRUNCATION_ERROR_CODES for code in _bard_error_codes(raw))
+
+
 def _extract_texts_from_line(line: str) -> list:
     """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
@@ -200,40 +218,100 @@ def _merge_text_segments(texts: list) -> str:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
+    _raise_for_bard_error(raw)
     texts = []
     for line in raw.split("\n"):
         texts.extend(_extract_texts_from_line(line))
     return clean_text(_merge_text_segments(texts))
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+def _continuation_prompt(original_prompt: str, partial_text: str) -> str:
+    context_chars = int(CONFIG.get("continuation_context_chars", 16000) or 16000)
+    original_tail = original_prompt[-6000:]
+    partial_tail = partial_text[-context_chars:]
+    return (
+        "The previous response was cut off by the upstream output limit. Continue exactly from the final "
+        "character of the partial response. Return only the missing continuation: do not restart, summarize, "
+        "repeat existing text, or add a new opening Markdown fence. Finish every incomplete code block and "
+        "the original task.\n\n"
+        f"Original request (tail):\n{original_tail}\n\n"
+        f"Partial response (tail):\n{partial_tail}"
+    )
+
+
+def _append_continuation(partial: str, continuation: str) -> str:
+    continuation = (continuation or "").lstrip()
+    if partial.count("```") % 2 and continuation.startswith("```"):
+        continuation = re.sub(r"^```[^\n]*\n?", "", continuation, count=1)
+    max_overlap = min(len(partial), len(continuation), 4000)
+    for overlap in range(max_overlap, 3, -1):
+        if partial.endswith(continuation[:overlap]):
+            continuation = continuation[overlap:]
+            break
+    return partial + continuation
+
+
+def _request_text(prompt: str, model_id: int, think_mode: int, file_refs=None, extra_fields=None) -> tuple:
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+    else:
+        resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+    raw = resp.read().decode("utf-8", errors="replace")
+    return extract_response_text(raw), _was_truncated(raw)
 
+
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    """Non-streaming generation with retry."""
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
-            else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text, truncated = _request_text(prompt, model_id, think_mode, file_refs, extra_fields)
+            if not text:
+                raise RuntimeError("Gemini upstream returned an empty response")
+            break
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
-    raise last_err
+    else:
+        raise last_err
+
+    for continuation_index in range(int(CONFIG.get("continuation_attempts", 2) or 0)):
+        if not truncated:
+            break
+        log(f"Upstream output truncated; requesting continuation {continuation_index + 1}")
+        continuation_prompt = _continuation_prompt(prompt, text)
+        continuation = ""
+        for attempt in range(CONFIG["retry_attempts"]):
+            try:
+                continuation, truncated = _request_text(
+                    continuation_prompt, model_id, think_mode, file_refs, extra_fields
+                )
+                if not continuation:
+                    raise RuntimeError("Gemini continuation returned an empty response")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < CONFIG["retry_attempts"] - 1:
+                    log(f"Continuation retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                    time.sleep(CONFIG["retry_delay_sec"])
+        if not continuation:
+            raise last_err
+        text = _append_continuation(text, continuation)
+    if truncated:
+        log("Warning: continuation limit reached while upstream still reports truncation")
+    return text
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
@@ -253,12 +331,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             emitted_text = ""
+            truncated = False
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        _raise_for_bard_error(line)
+                        truncated = truncated or _was_truncated(line)
                         for t in _extract_texts_from_line(line):
                             next_text = _merge_text_segments([emitted_text, t])
                             if len(next_text) <= len(emitted_text):
@@ -267,9 +348,26 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
                             emitted_text = next_text
+            if not emitted_text:
+                raise RuntimeError("Gemini upstream returned an empty response")
+            if truncated:
+                log("Upstream stream truncated; requesting continuation")
+                continuation = generate(
+                    _continuation_prompt(prompt, emitted_text),
+                    model_id,
+                    think_mode,
+                    file_refs,
+                    extra_fields,
+                )
+                completed = _append_continuation(emitted_text, continuation)
+                delta = completed[len(emitted_text):]
+                if delta:
+                    yield delta
             return
         except Exception as e:
             last_err = e
+            if emitted_text:
+                raise
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])

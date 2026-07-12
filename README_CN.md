@@ -216,6 +216,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "max_history_chars": 60000,
   "max_google_prompt_chars": 18000,
   "google_stream_auto_tools": false,
+  "continuation_attempts": 2,
+  "sse_heartbeat_sec": 10,
   "tool_retry_attempts": 1
 }
 ```
@@ -229,7 +231,11 @@ Agent 相关配置:
 - `max_history_messages` / `max_history_chars`: 历史上下文压缩上限
 - `max_google_prompt_chars`: Google 原生接口发往上游的 prompt 字符上限；超长时优先裁掉更早的上下文, 降低空回复/截断概率
 - `google_stream_auto_tools`: 保持 `false` 可优先保证 Open WebUI/NewAPI 这类流式聊天稳定；只有需要 Google 原生流式 AUTO 工具调用时才设为 `true`
+- `continuation_attempts`: Gemini Web 明确返回输出上限标记 (`BardErrorInfo 1155`) 时，自动从断点续写的最大轮数
+- `sse_heartbeat_sec`: 等待 Gemini 首段或 agent 工具决策期间发送 SSE 注释心跳的间隔，避免 NewAPI、Open WebUI 或反向代理把仍在工作的请求当成断连
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
+
+流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
 
 ## Docker 部署
 
