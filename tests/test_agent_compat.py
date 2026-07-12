@@ -302,6 +302,43 @@ class AgentCompatTests(unittest.TestCase):
         self.assertEqual(state["backend"], "gemini_webapi")
         self.assertEqual(state_to_metadata(state), metadata)
 
+    def test_webapi_fresh_chats_do_not_share_metadata(self):
+        class FakeChat:
+            _ChatSession__metadata = ["shared", "rid", "rcid", None, None, None, None, None, None, ""]
+
+            @property
+            def metadata(self):
+                return self._ChatSession__metadata
+
+        class FakeClient:
+            def start_chat(self, model):
+                return FakeChat()
+
+        first = webapi_backend._start_isolated_chat(FakeClient(), "flash")
+        first._ChatSession__metadata[0] = "first-cid"
+        second = webapi_backend._start_isolated_chat(FakeClient(), "flash")
+        self.assertEqual(second.metadata[0], "")
+        self.assertIsNot(first.metadata, second.metadata)
+
+    def test_webapi_resumed_chat_owns_complete_metadata(self):
+        class FakeChat:
+            _ChatSession__metadata = []
+
+            @property
+            def metadata(self):
+                return self._ChatSession__metadata
+
+        class FakeClient:
+            def start_chat(self, model):
+                return FakeChat()
+
+        state = metadata_to_state(
+            ["cid", "rid", "rcid", None, None, None, None, None, None, "context"]
+        )
+        chat = webapi_backend._start_isolated_chat(FakeClient(), "flash", state)
+        self.assertEqual(chat.metadata, state["metadata"])
+        self.assertIsNot(chat.metadata, state["metadata"])
+
     def test_webapi_dependency_imports_client_and_model_when_installed(self):
         try:
             import gemini_webapi

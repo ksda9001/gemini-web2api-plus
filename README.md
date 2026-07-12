@@ -355,6 +355,8 @@ resp = client.chat.completions.create(
 
 This tool converts OpenAI, Anthropic, and Gemini requests into Gemini Web conversations. Its primary session backend reuses `HanaokaYuzu/Gemini-API` for dynamic page tokens, model discovery, cookie rotation, and `ChatSession.metadata`; SQLite links that metadata to client-visible history. The older `[79]` mode payload remains only as a direct fallback.
 
+The adapter gives every API conversation its own metadata list and explicitly restores the intended CID. This also works around the shared `DEFAULT_METADATA` list in the published `gemini-webapi 2.0.0` wheel, preventing unrelated API conversations from being appended to one Gemini Web history item.
+
 ## Acknowledgments
 
 - Inspired by the open-source API proxy ecosystem

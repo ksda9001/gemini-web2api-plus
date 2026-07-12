@@ -96,6 +96,18 @@ def metadata_to_state(metadata: list) -> dict:
     }
 
 
+def _start_isolated_chat(client, model, state: dict = None):
+    """Create a chat without inheriting gemini-webapi 2.0.0's shared metadata list."""
+    chat = client.start_chat(model=model)
+    # PyPI 2.0.0 assigns DEFAULT_METADATA directly instead of copying it. Using
+    # the public setter would mutate that same global list, so replace the
+    # private slot with an owned list for both fresh and resumed conversations.
+    chat._ChatSession__metadata = state_to_metadata(state) if state else [
+        "", "", "", None, None, None, None, None, None, ""
+    ]
+    return chat
+
+
 class GeminiWebAPIBackend:
     """Run the async Gemini web client on one persistent background event loop."""
 
@@ -176,16 +188,14 @@ class GeminiWebAPIBackend:
 
     async def _generate(self, prompt: str, model_name: str, state: dict = None):
         client = await self._ensure_client()
-        metadata = state_to_metadata(state) if state else None
-        chat = client.start_chat(metadata=metadata, model=self._model(client, model_name))
+        chat = _start_isolated_chat(client, self._model(client, model_name), state)
         output = await chat.send_message(prompt)
         return output.text, metadata_to_state(chat.metadata)
 
     async def _stream(self, result, prompt: str, model_name: str, state: dict = None):
         try:
             client = await self._ensure_client()
-            metadata = state_to_metadata(state) if state else None
-            chat = client.start_chat(metadata=metadata, model=self._model(client, model_name))
+            chat = _start_isolated_chat(client, self._model(client, model_name), state)
             async for output in chat.send_message_stream(prompt):
                 if output.text_delta:
                     result._queue.put(("delta", output.text_delta))

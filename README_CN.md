@@ -328,6 +328,8 @@ python -m gemini_web2api
 
 服务把 OpenAI/Anthropic/Gemini 格式转成 Gemini Web 请求。主会话后端复用 `HanaokaYuzu/Gemini-API` 的动态网页 token、模型发现、Cookie 轮换和 `ChatSession.metadata`；SQLite 保存 metadata 与客户端消息历史的关联。旧的 `[79]` 模式请求仅作为 direct 回退。
 
+适配层会为每个 API 对话创建独立的 metadata 列表，并显式恢复目标 CID。这也规避了 `gemini-webapi 2.0.0` 发布包中 `DEFAULT_METADATA` 被不同 `ChatSession` 共享的问题，防止互不相关的 API 对话串入同一条 Gemini 网页历史。
+
 ## 致谢
 
 - [linux.do](https://linux.do) 社区
