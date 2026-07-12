@@ -108,6 +108,7 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 
 Agent 兼容能力包括:
 - 当模型只描述动作而没有调用工具时, 自动进行一次工具调用修复重试
+- 当模型生成客户端未声明的工具名时, 拒绝该调用并自动修复
 - 使用 SQLite 保存 Responses 历史, 支持 `previous_response_id` 和 `GET /v1/responses/{id}`
 - 实验性保存 Gemini Web 的 `conversation_id` / `response_id` / `choice_id`，但仅在账号支持上游续接时启用
 - 完整 Agent 行为指令只在工具链首轮发送；无状态后续轮使用紧凑 JSON 工具 schema

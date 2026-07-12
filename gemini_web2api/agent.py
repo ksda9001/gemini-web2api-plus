@@ -210,6 +210,31 @@ def should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_c
     return True
 
 
+def allowed_tool_names(tools) -> list:
+    names = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return list(dict.fromkeys(names))
+
+
+def filter_tool_calls(tool_calls, tools) -> list:
+    """Drop model-invented tool names before they reach an agent client."""
+    allowed = set(allowed_tool_names(tools))
+    if not allowed:
+        return []
+    return [
+        call for call in (tool_calls or [])
+        if isinstance(call, dict)
+        and isinstance(call.get("function"), dict)
+        and call["function"].get("name") in allowed
+    ]
+
+
 def fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
     """Return a safe read-only shell call when Gemini refuses an obvious agent action.
 
@@ -253,12 +278,16 @@ def fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
     return None
 
 
-def build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
+def build_tool_retry_prompt(prompt: str, tool_choice=None, tools=None) -> str:
     target = ""
     if isinstance(tool_choice, dict):
         fn_name = tool_choice.get("function", {}).get("name", "")
         if fn_name:
             target = f' Call only "{fn_name}".'
+    elif allowed_tool_names(tools):
+        target = " Call only one of these declared tools: " + ", ".join(
+            f'"{name}"' for name in allowed_tool_names(tools)
+        ) + "."
     return (
         f"{prompt}\n\n"
         "[System instruction]: Your previous answer did not call a tool even though a tool is required or needed. "

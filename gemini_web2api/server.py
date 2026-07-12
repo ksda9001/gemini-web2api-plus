@@ -29,6 +29,7 @@ from .agent import (
     build_tool_retry_prompt,
     compact_messages,
     fallback_tool_call,
+    filter_tool_calls,
     response_call_to_tool_call,
     response_content_to_message_parts,
     response_messages_from_output,
@@ -376,13 +377,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+            tool_calls = filter_tool_calls(tool_calls, tools)
         if should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_prompt = build_tool_retry_prompt(prompt, tool_choice)
+                retry_prompt = build_tool_retry_prompt(prompt, tool_choice, tools)
                 try:
-                    retry_fallback = build_tool_retry_prompt(fallback_prompt, tool_choice)
+                    retry_fallback = build_tool_retry_prompt(fallback_prompt, tool_choice, tools)
                     retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
-                        build_tool_retry_prompt("", tool_choice),
+                        build_tool_retry_prompt("", tool_choice, tools),
                         retry_fallback,
                         model_id,
                         think_mode,
@@ -395,6 +397,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                retry_calls = filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
@@ -668,12 +671,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+            tool_calls = filter_tool_calls(tool_calls, tools)
         if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
                     retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
-                        build_tool_retry_prompt("", tool_choice),
-                        build_tool_retry_prompt(fallback_prompt, tool_choice),
+                        build_tool_retry_prompt("", tool_choice, tools),
+                        build_tool_retry_prompt(fallback_prompt, tool_choice, tools),
                         model_id,
                         think_mode,
                         images,
@@ -685,6 +689,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                retry_calls = filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
@@ -935,12 +940,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = sanitize_model_text(text)
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+            tool_calls = filter_tool_calls(tool_calls, tools)
         if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
                     retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
-                        build_tool_retry_prompt("", tool_choice),
-                        build_tool_retry_prompt(fallback_prompt, tool_choice),
+                        build_tool_retry_prompt("", tool_choice, tools),
+                        build_tool_retry_prompt(fallback_prompt, tool_choice, tools),
                         model_id,
                         think_mode,
                         images,
@@ -952,6 +958,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 except Exception:
                     break
                 retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                retry_calls = filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break

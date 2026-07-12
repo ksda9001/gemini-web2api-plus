@@ -118,6 +118,7 @@ export ANTHROPIC_MODEL=gemini-3.5-flash
 
 Agent compatibility includes:
 - automatic tool-call repair retry when the model describes an action instead of calling a tool
+- rejection and repair of model-invented tool names that were not declared by the client
 - SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
 - experimental Gemini Web `conversation_id` / `response_id` / `choice_id` persistence for accounts that support upstream continuation
 - the full Agent behavior instruction only on the first tool turn, plus compact JSON tool schemas on stateless follow-up turns

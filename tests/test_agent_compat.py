@@ -14,7 +14,7 @@ from unittest.mock import patch
 import gemini_web2api.gemini as gemini
 from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
-from gemini_web2api.agent import ResponseStore
+from gemini_web2api.agent import ResponseStore, filter_tool_calls
 from gemini_web2api.config import CONFIG
 from gemini_web2api.tools import messages_to_prompt, parse_tool_calls, strip_tool_call_protocol
 
@@ -244,6 +244,19 @@ class AgentCompatTests(unittest.TestCase):
         self.assertIn("# Tool Use", prompt)
         self.assertIn('"name":"shell_command"', prompt)
         self.assertIn("continue after each result until done", prompt)
+
+    def test_unknown_tool_calls_are_removed(self):
+        calls = [{
+            "id": "call_bad",
+            "type": "function",
+            "function": {"name": "google:search", "arguments": "{}"},
+        }, {
+            "id": "call_good",
+            "type": "function",
+            "function": {"name": "shell_command", "arguments": '{"command":"pwd"}'},
+        }]
+        filtered = filter_tool_calls(calls, TOOLS)
+        self.assertEqual([c["function"]["name"] for c in filtered], ["shell_command"])
 
     def test_extract_response_text_uses_cumulative_segments_without_duplication(self):
         raw = "\n".join([
@@ -671,6 +684,67 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(call["name"], "shell_command")
                 self.assertEqual(json.loads(call["arguments"])["command"], "pwd; ls")
                 self.assertEqual(len(harness.prompts), 2)
+            finally:
+                harness.close()
+
+    def test_responses_repairs_model_invented_tool_name(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"google:search","arguments":{"query":"pwd"}}',
+                '{"name":"shell_command","arguments":{"command":"pwd"}}',
+            ])
+            try:
+                response = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "run pwd",
+                    "tools": TOOLS,
+                    "tool_choice": "required",
+                })
+                self.assertEqual(response["output"][0]["type"], "function_call")
+                self.assertEqual(response["output"][0]["name"], "shell_command")
+                self.assertIn('"shell_command"', harness.prompts[1])
+                self.assertNotIn('"google:search"', harness.prompts[1])
+            finally:
+                harness.close()
+
+    def test_chat_completions_repairs_model_invented_tool_name(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"google:search","arguments":{"query":"pwd"}}',
+                '{"name":"shell_command","arguments":{"command":"pwd"}}',
+            ])
+            try:
+                response = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "run pwd"}],
+                    "tools": TOOLS,
+                    "tool_choice": "required",
+                })
+                call = response["choices"][0]["message"]["tool_calls"][0]
+                self.assertEqual(call["function"]["name"], "shell_command")
+                self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+            finally:
+                harness.close()
+
+    def test_anthropic_repairs_model_invented_tool_name(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                '{"name":"google:search","arguments":{"query":"pwd"}}',
+                '{"name":"shell_command","arguments":{"command":"pwd"}}',
+            ])
+            try:
+                response = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "run pwd"}],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                    "tool_choice": {"type": "any"},
+                })
+                self.assertEqual(response["content"][0]["name"], "shell_command")
+                self.assertEqual(response["stop_reason"], "tool_use")
             finally:
                 harness.close()
 

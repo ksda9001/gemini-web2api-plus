@@ -860,6 +860,30 @@ def _should_retry_tool_call(messages: list, tools, tool_choice, text: str, tool_
     return bool(text and ACTION_RE.search(text))
 
 
+def _allowed_tool_names(tools) -> list:
+    names = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return list(dict.fromkeys(names))
+
+
+def _filter_tool_calls(tool_calls, tools) -> list:
+    allowed = set(_allowed_tool_names(tools))
+    if not allowed:
+        return []
+    return [
+        call for call in (tool_calls or [])
+        if isinstance(call, dict)
+        and isinstance(call.get("function"), dict)
+        and call["function"].get("name") in allowed
+    ]
+
+
 def _fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
     if not _should_retry_tool_call(messages, tools, tool_choice, "", None):
         return None
@@ -894,12 +918,16 @@ def _fallback_tool_call(messages: list, tools, tool_choice=None) -> list:
     return None
 
 
-def _build_tool_retry_prompt(prompt: str, tool_choice=None) -> str:
+def _build_tool_retry_prompt(prompt: str, tool_choice=None, tools=None) -> str:
     target = ""
     if isinstance(tool_choice, dict):
         fn_name = tool_choice.get("function", {}).get("name", "")
         if fn_name:
             target = f' Call only "{fn_name}".'
+    elif _allowed_tool_names(tools):
+        target = " Call only one of these declared tools: " + ", ".join(
+            f'"{name}"' for name in _allowed_tool_names(tools)
+        ) + "."
     return (
         f"{prompt}\n\n"
         "[System instruction]: Your previous answer described the action instead of calling a tool. "
@@ -1212,9 +1240,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
         text = _sanitize_model_text(text)
+        tool_calls = _filter_tool_calls(tool_calls, tools)
         if _should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice, tools), model_id, think_mode, tools)
+                retry_calls = _filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
@@ -1492,9 +1522,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
         text = _sanitize_model_text(text)
+        tool_calls = _filter_tool_calls(tool_calls, tools)
         if _should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice, tools), model_id, think_mode, tools)
+                retry_calls = _filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
@@ -1688,9 +1720,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
             return
         text = _sanitize_model_text(text)
+        tool_calls = _filter_tool_calls(tool_calls, tools)
         if _should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice), model_id, think_mode, tools)
+                retry_text, retry_calls = self._call_gemini(_build_tool_retry_prompt(prompt, tool_choice, tools), model_id, think_mode, tools)
+                retry_calls = _filter_tool_calls(retry_calls, tools)
                 if retry_calls:
                     text, tool_calls = _sanitize_model_text(retry_text), retry_calls
                     break
