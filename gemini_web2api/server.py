@@ -474,6 +474,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream:
             self._start_sse()
             stream_started = True
+        fallback_used = False
+        tool_calls = None
         try:
             text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
@@ -487,22 +489,28 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 stream_started,
             )
         except Exception as e:
-            if stream_started:
-                error = {"error": {"message": f"upstream error: {e}"}}
-                self.wfile.write(f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+            tool_calls = fallback_tool_call(chat_messages, tools, tool_choice)
+            if tool_calls:
+                log(f"Agent upstream failed; returning safe tool fallback: {e}")
+                text = ""
+                upstream_state = {}
+                usage_prompt = fallback_prompt
+                fallback_used = True
             else:
-                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
+                if stream_started:
+                    error = {"error": {"message": f"upstream error: {e}"}}
+                    self.wfile.write(f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
 
-        tool_calls = None
-        fallback_used = False
         text = sanitize_model_text(text)
-        if tools and text and tool_choice != "none":
+        if not fallback_used and tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
             tool_calls = filter_tool_calls(tool_calls, tools)
-        if should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
+        if not fallback_used and should_retry_tool_call(chat_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 retry_prompt = build_tool_retry_prompt(prompt, tool_choice, tools)
                 try:
@@ -526,7 +534,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
-        if not tool_calls:
+        if not fallback_used and not tool_calls:
             tool_calls = fallback_tool_call(chat_messages, tools, tool_choice)
             if tool_calls:
                 text = ""
@@ -776,6 +784,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream_started = bool(req.get("stream"))
         if stream_started:
             self._start_sse()
+        fallback_used = False
+        tool_calls = None
         try:
             text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
@@ -789,19 +799,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 stream_started,
             )
         except Exception as e:
-            if stream_started:
-                self._write_sse("error", {"type": "error", "message": f"upstream error: {e}"})
+            tool_calls = fallback_tool_call(messages, tools, tool_choice)
+            if tool_calls:
+                log(f"Agent upstream failed; returning safe tool fallback: {e}")
+                text = ""
+                upstream_state = {}
+                usage_prompt = fallback_prompt
+                fallback_used = True
             else:
-                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
+                if stream_started:
+                    self._write_sse("error", {"type": "error", "message": f"upstream error: {e}"})
+                else:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
 
-        tool_calls = None
-        fallback_used = False
         text = sanitize_model_text(text)
-        if tools and text and tool_choice != "none":
+        if not fallback_used and tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
             tool_calls = filter_tool_calls(tool_calls, tools)
-        if should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
+        if not fallback_used and should_retry_tool_call(messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
                     retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
@@ -823,7 +839,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
-        if not tool_calls:
+        if not fallback_used and not tool_calls:
             tool_calls = fallback_tool_call(messages, tools, tool_choice)
             if tool_calls:
                 text = ""
@@ -1047,6 +1063,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream_started = bool(req.get("stream"))
         if stream_started:
             self._start_sse()
+        fallback_used = False
+        tool_calls = None
         try:
             text, upstream_state, usage_prompt = self._generate_agent_turn(
                 prompt,
@@ -1060,20 +1078,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 stream_started,
             )
         except Exception as e:
-            error = {"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}
-            if stream_started:
-                self._write_sse("error", error)
+            tool_calls = fallback_tool_call(anthropic_messages, tools, tool_choice)
+            if tool_calls:
+                log(f"Agent upstream failed; returning safe tool fallback: {e}")
+                text = ""
+                upstream_state = {}
+                usage_prompt = fallback_prompt
+                fallback_used = True
             else:
-                self.send_json(error, 502)
-            return
+                error = {"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}
+                if stream_started:
+                    self._write_sse("error", error)
+                else:
+                    self.send_json(error, 502)
+                return
 
-        tool_calls = None
-        fallback_used = False
         text = sanitize_model_text(text)
-        if tools and text and tool_choice != "none":
+        if not fallback_used and tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
             tool_calls = filter_tool_calls(tool_calls, tools)
-        if should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
+        if not fallback_used and should_retry_tool_call(anthropic_messages, tools, tool_choice, text, tool_calls):
             for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
                 try:
                     retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
@@ -1095,7 +1119,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if retry_calls:
                     text, tool_calls = retry_clean, retry_calls
                     break
-        if not tool_calls:
+        if not fallback_used and not tool_calls:
             tool_calls = fallback_tool_call(anthropic_messages, tools, tool_choice)
             if tool_calls:
                 text = ""

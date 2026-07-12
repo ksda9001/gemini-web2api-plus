@@ -110,7 +110,10 @@ class HttpHarness:
     def _fake_generate_with_state(self, prompt, *args, **kwargs):
         self.prompts.append(prompt)
         index = len(self.prompts)
-        return next(self._responses), {
+        response = next(self._responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response, {
             "conversation_id": "c_test",
             "response_id": f"r_{index}",
             "choice_id": f"rc_{index}",
@@ -1160,6 +1163,57 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(call["name"], "shell_command")
                 self.assertEqual(json.loads(call["arguments"])["command"], "pwd; ls")
                 self.assertEqual(len(harness.prompts), 2)
+            finally:
+                harness.close()
+
+    def test_responses_returns_safe_tool_when_upstream_errors(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [RuntimeError("upstream empty")])
+            try:
+                response = harness.post("/v1/responses", {
+                    "model": "gemini-3.5-flash",
+                    "input": "inspect the workspace",
+                    "tools": TOOLS,
+                    "tool_choice": "required",
+                })
+                self.assertEqual(response["output"][0]["type"], "function_call")
+                self.assertEqual(response["output"][0]["name"], "shell_command")
+            finally:
+                harness.close()
+
+    def test_chat_completions_returns_safe_tool_when_upstream_errors(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [RuntimeError("upstream empty")])
+            try:
+                response = harness.post("/v1/chat/completions", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": TOOLS,
+                    "tool_choice": "required",
+                })
+                call = response["choices"][0]["message"]["tool_calls"][0]
+                self.assertEqual(call["function"]["name"], "shell_command")
+                self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+            finally:
+                harness.close()
+
+    def test_anthropic_returns_safe_tool_when_upstream_errors(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [RuntimeError("upstream empty")])
+            try:
+                response = harness.post("/v1/messages", {
+                    "model": "gemini-3.5-flash",
+                    "messages": [{"role": "user", "content": "inspect the workspace"}],
+                    "tools": [{
+                        "name": "shell_command",
+                        "description": "Run a shell command",
+                        "input_schema": TOOLS[0]["parameters"],
+                    }],
+                    "tool_choice": {"type": "any"},
+                })
+                self.assertEqual(response["content"][0]["type"], "tool_use")
+                self.assertEqual(response["content"][0]["name"], "shell_command")
+                self.assertEqual(response["stop_reason"], "tool_use")
             finally:
                 harness.close()
 
