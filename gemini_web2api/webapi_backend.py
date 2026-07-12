@@ -10,7 +10,8 @@ from concurrent.futures import Future
 from .config import CONFIG
 
 try:
-    from gemini_webapi import GeminiClient, Model
+    from gemini_webapi import GeminiClient
+    from gemini_webapi.constants import Model
 except ImportError:  # Keep source-only test environments usable.
     GeminiClient = None
     Model = None

@@ -15,6 +15,7 @@ from unittest.mock import patch
 import gemini_web2api.gemini as gemini
 from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
+import gemini_web2api.webapi_backend as webapi_backend
 from gemini_web2api.agent import ResponseStore, filter_tool_calls
 from gemini_web2api.config import CONFIG
 from gemini_web2api.tools import messages_to_prompt, parse_tool_calls, strip_tool_call_protocol
@@ -300,6 +301,14 @@ class AgentCompatTests(unittest.TestCase):
         state = metadata_to_state(metadata)
         self.assertEqual(state["backend"], "gemini_webapi")
         self.assertEqual(state_to_metadata(state), metadata)
+
+    def test_webapi_dependency_imports_client_and_model_when_installed(self):
+        try:
+            import gemini_webapi
+        except ImportError:
+            self.skipTest("gemini-webapi is not installed in the source-only test environment")
+        self.assertIs(webapi_backend.GeminiClient, gemini_webapi.GeminiClient)
+        self.assertIsNotNone(webapi_backend.Model)
 
     def test_generate_with_state_uses_webapi_session_backend(self):
         previous = {
