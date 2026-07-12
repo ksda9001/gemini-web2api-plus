@@ -355,13 +355,21 @@ def generate_with_state(
     fallback_prompt: str = None,
     model_name: str = None,
     temporary: bool = False,
+    allow_webapi: bool = True,
 ) -> tuple:
     """Generate text and return Gemini Web conversation state for the next turn."""
     session_backend = CONFIG.get("upstream_session_backend", "direct")
     can_use_webapi = (
+        allow_webapi
+        and
         CONFIG.get("reuse_upstream_sessions", False)
         and session_backend == "gemini_webapi"
         and not file_refs
+        and (
+            CONFIG.get("reuse_upstream_agent_sessions", False)
+            or not conversation
+            or conversation.get("backend") != "gemini_webapi_agent"
+        )
         and (not conversation or conversation.get("backend") in (None, "gemini_webapi"))
     )
     if can_use_webapi:

@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
     "reuse_upstream_sessions": False,
     "upstream_session_backend": "gemini_webapi",
     "upstream_session_fallback_direct": True,
+    "reuse_upstream_agent_sessions": False,
+    "agent_use_webapi": False,
     "cookie_cache_path": "/app/data/gemini_cookies",
     "cookie_auto_refresh": True,
     "cookie_refresh_interval_sec": 600,

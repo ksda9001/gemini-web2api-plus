@@ -27,6 +27,8 @@
   "reuse_upstream_sessions": false,
   "upstream_session_backend": "gemini_webapi",
   "upstream_session_fallback_direct": true,
+  "reuse_upstream_agent_sessions": false,
+  "agent_use_webapi": false,
   "cookie_cache_path": "/app/data/gemini_cookies",
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,

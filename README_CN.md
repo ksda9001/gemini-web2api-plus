@@ -227,6 +227,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "reuse_upstream_sessions": false,
   "upstream_session_backend": "gemini_webapi",
   "upstream_session_fallback_direct": true,
+  "reuse_upstream_agent_sessions": false,
+  "agent_use_webapi": false,
   "cookie_cache_path": "/app/data/gemini_cookies",
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,
@@ -252,6 +254,8 @@ Agent 相关配置:
 - `reuse_upstream_sessions`: 启用 Gemini Web 上游会话复用；保存完整 metadata，普通 Chat Completions、Claude Messages、Codex Responses、Google 原生 `/v1beta` 普通聊天和三种 Agent 工具链均可使用。匿名部署默认保持 `false`；配置同一浏览器会话的 Cookie 后再启用
 - `upstream_session_backend`: `gemini_webapi` 使用动态网页 token/模型 header 和 Cookie 刷新；`direct` 保留旧逆向请求实现
 - `upstream_session_fallback_direct`: 新后端初始化或续接失败时，自动用完整历史回退到 direct 后端
+- `reuse_upstream_agent_sessions`: 默认保持 `false`。普通聊天可安全复用 Gemini Web metadata；Agent 的工具结果轮会带完整压缩工具历史走 direct 后端，因为 Gemini Web 对合成工具协议的会话续接可能停滞
+- `agent_use_webapi`: 默认保持 `false`。Agent 工具决策使用 direct 后端；对于合成 tool-call 协议，它比 Gemini Web 的聊天会话渲染器更可靠
 - `cookie_cache_path`: 自动轮换后的 Google Cookie 私有缓存目录；必须放在持久化 volume 中，不能提交 Git
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: 后台轮换 `__Secure-1PSIDTS` 并保存，避免长期运行后认证过期
 - `webapi_watchdog_sec`: Gemini 流长时间无数据时判定停滞并恢复的阈值

@@ -165,7 +165,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
         full_prompt, images = messages_to_prompt(messages, tools, tool_choice)
         session = (
             _response_store().find_agent_session(model_name, messages)
-            if tools and CONFIG.get("reuse_upstream_sessions", False)
+            if (
+                tools
+                and CONFIG.get("reuse_upstream_sessions", False)
+                and CONFIG.get("reuse_upstream_agent_sessions", False)
+            )
             else {}
         )
         if session:
@@ -257,6 +261,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             upstream_state,
             fallback_prompt,
             model_name=model_name,
+            allow_webapi=bool(CONFIG.get("agent_use_webapi", False)),
         )
         return self._run_with_sse_heartbeats(callback) if stream_started else callback()
 
@@ -271,6 +276,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         aliases = tool_call_ids(list(input_messages or []) + [assistant_message])
         if (
             not CONFIG.get("reuse_upstream_sessions", False)
+            or not CONFIG.get("reuse_upstream_agent_sessions", False)
             or not aliases
             or not upstream_state
         ):

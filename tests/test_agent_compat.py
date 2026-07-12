@@ -60,7 +60,13 @@ def load_single_file_module():
 
 
 class HttpHarness:
-    def __init__(self, tmpdir, responses, reuse_upstream_sessions=True):
+    def __init__(
+        self,
+        tmpdir,
+        responses,
+        reuse_upstream_sessions=True,
+        reuse_upstream_agent_sessions=False,
+    ):
         self.prompts = []
         self._responses = iter(responses)
         self._original_generate = server.generate
@@ -82,6 +88,8 @@ class HttpHarness:
             "max_google_prompt_chars": 18000,
             "google_stream_auto_tools": False,
             "reuse_upstream_sessions": reuse_upstream_sessions,
+            "reuse_upstream_agent_sessions": reuse_upstream_agent_sessions,
+            "agent_use_webapi": False,
             "upstream_session_backend": "gemini_webapi",
             "upstream_session_fallback_direct": True,
             "tool_retry_attempts": 1,
@@ -546,6 +554,74 @@ class AgentCompatTests(unittest.TestCase):
             state,
             temporary=False,
         )
+
+    def test_agent_marked_state_skips_webapi_session_resume_by_default(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "reuse_upstream_sessions",
+                "upstream_session_backend",
+                "reuse_upstream_agent_sessions",
+                "retry_attempts",
+            )
+        }
+        state = metadata_to_state(["c1", "r1", "rc1", None, None, None, None, None, None, "ctx"])
+        state["backend"] = "gemini_webapi_agent"
+        direct_state = {"backend": "direct", "conversation_id": "c2", "response_id": "r2", "choice_id": "rc2"}
+        CONFIG.update({
+            "reuse_upstream_sessions": True,
+            "upstream_session_backend": "gemini_webapi",
+            "reuse_upstream_agent_sessions": False,
+            "retry_attempts": 1,
+        })
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+            ) as webapi_generate, patch.object(
+                gemini,
+                "_request_text",
+                return_value=("continued", False, direct_state),
+            ) as direct_request:
+                text, returned_state, _ = gemini.generate_with_state(
+                    "tool result",
+                    1,
+                    0,
+                    conversation=state,
+                    fallback_prompt="full tool history",
+                    model_name="gemini-3.5-flash",
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "continued")
+        self.assertEqual(returned_state, direct_state)
+        webapi_generate.assert_not_called()
+        self.assertEqual(direct_request.call_args.args[0], "tool result")
+
+    def test_agent_turn_disables_webapi_by_default(self):
+        handler = object.__new__(server.GeminiHandler)
+        previous = CONFIG.get("agent_use_webapi")
+        CONFIG["agent_use_webapi"] = False
+        try:
+            with patch.object(
+                server,
+                "generate_with_state",
+                return_value=("tool call", {}, "prompt"),
+            ) as generate:
+                text, state, usage = handler._generate_agent_turn(
+                    "tool prompt",
+                    "full prompt",
+                    1,
+                    0,
+                    "gemini-3.5-flash",
+                    [],
+                    {},
+                    None,
+                    False,
+                )
+        finally:
+            CONFIG["agent_use_webapi"] = previous
+        self.assertEqual((text, state, usage), ("tool call", {}, "prompt"))
+        self.assertFalse(generate.call_args.kwargs["allow_webapi"])
 
     def test_generate_with_state_forwards_temporary_to_webapi(self):
         previous = {
@@ -1217,7 +1293,7 @@ class AgentCompatTests(unittest.TestCase):
             harness = HttpHarness(tmpdir, [
                 '{"name":"shell_command","arguments":{"command":"pwd"}}',
                 "Done after reading the tool result.",
-            ])
+            ], reuse_upstream_agent_sessions=True)
             try:
                 first = harness.post("/v1/chat/completions", {
                     "model": "gemini-3.5-flash",
@@ -1686,7 +1762,7 @@ class AgentCompatTests(unittest.TestCase):
             harness = HttpHarness(tmpdir, [
                 '{"name":"shell_command","arguments":{"command":"pwd"}}',
                 "Done after reading the tool result.",
-            ])
+            ], reuse_upstream_agent_sessions=True)
             try:
                 first = harness.post("/v1/messages", {
                     "model": "gemini-3.5-flash",
