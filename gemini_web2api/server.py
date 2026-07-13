@@ -1268,7 +1268,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         request_text = _google_request_text(req)
         temporary = _is_background_metadata_prompt(request_text)
         converted_agent = (
-            bool(CONFIG.get("google_stream_auto_agent_tools", True))
+            CONFIG.get("google_stream_auto_agent_tools", True) is not False
             and _is_google_agent_request(req)
             and not temporary
         )

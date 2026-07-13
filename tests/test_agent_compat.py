@@ -1900,6 +1900,25 @@ class AgentCompatTests(unittest.TestCase):
             finally:
                 harness.close()
 
+    def test_google_agent_tools_default_on_for_legacy_null_config(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                'function_call\n{"name":"shell_command","args":{"command":"pwd"}}',
+            ])
+            previous = CONFIG.get("google_stream_auto_agent_tools")
+            CONFIG["google_stream_auto_agent_tools"] = None
+            try:
+                response = harness.post("/v1beta/models/gemini-3.5-flash:generateContent", {
+                    "systemInstruction": {"parts": [{"text": "You are Codex, an AI coding agent."}]},
+                    "contents": [{"role": "user", "parts": [{"text": "检查当前项目"}]}],
+                    "tools": GOOGLE_TOOLS,
+                    "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                })
+                self.assertIn("functionCall", response["candidates"][0]["content"]["parts"][0])
+            finally:
+                CONFIG["google_stream_auto_agent_tools"] = previous
+                harness.close()
+
     def test_google_stream_keeps_tools_for_converted_codex_and_copilot(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             harness = HttpHarness(tmpdir, [
