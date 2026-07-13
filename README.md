@@ -233,7 +233,9 @@ Create `config.json` in the same directory:
   "max_history_messages": 40,
   "max_history_chars": 60000,
   "max_google_prompt_chars": 18000,
+  "max_google_agent_prompt_chars": 40000,
   "google_stream_auto_tools": false,
+  "google_stream_auto_agent_tools": true,
   "continuation_attempts": 2,
   "sse_heartbeat_sec": 10,
   "reuse_upstream_sessions": false,
@@ -264,7 +266,9 @@ Agent-related config:
 - `max_tool_output_chars`: head/tail truncation limit for shell/tool outputs stored in context
 - `max_history_messages` / `max_history_chars`: deterministic context compaction limits
 - `max_google_prompt_chars`: hard cap for Google native prompt text sent upstream; older context is trimmed first to reduce empty/truncated responses
-- `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
+- `max_google_agent_prompt_chars`: separate cap for Google requests carrying an Agent tool schema; it defaults to `40000` because Claude/Codex/Copilot system prompts are larger than ordinary chat prompts
+- `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling for otherwise unmarked requests
+- `google_stream_auto_agent_tools`: when `true`, automatically preserves tools for Google-native requests converted from Claude Code, Codex, or Copilot. The request is recognized from its Agent system markers, while ordinary Open WebUI/NewAPI chat remains text-only under the previous setting
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
 - `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for plain chats and Agent tool loops across Chat Completions, Claude Messages, Codex Responses, and Google-native `/v1beta`. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
@@ -284,6 +288,8 @@ Agent-related config:
 - `webapi_allow_unverified_account`: keep `false` by default. Set it to `true` only after a real Gemini Web probe with the mounted Cookie can create a visible conversation and receive a response, but the external `gemini-webapi` library still misreports `UNAUTHENTICATED`; it permits that known library-status false positive without disabling Cookie checks
 
 Agent Web continuation is incremental: the initial turn sends the behavior instruction, tool schema, and task once. Gemini is told that it is the decision layer of an external runtime: it requests functions, while Codex, Claude Code, or Copilot executes them. A successful tool call saves its Gemini conversation metadata under the client call ID in SQLite. Later turns resume that CID with only a compact trusted tool-call/result receipt and any new user text; the receipt explicitly identifies completed execution data rather than a user prompt, so Gemini continues the task instead of treating the result as a simulated terminal transcript. A lone `.` supplied alongside a tool event is treated as a client placeholder and is not sent to Gemini. If the external `gemini-webapi` adapter rejects the account session, the fallback still targets Gemini Web's `StreamGenerate` endpoint and preserves CID continuation when Google returns usable metadata.
+
+When NewAPI converts Claude Messages, Codex Responses, or Copilot Chat Completions into Google `streamGenerateContent`, the same Agent path is selected from the converted system prompt. Google `functionCall` parts are converted back to the client's tool protocol, and the stable generated call ID is used to find the matching Gemini CID in SQLite on the next tool-result request. Claude title/metadata requests remain temporary tool-free requests even when their system prompt contains an Agent marker.
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 

@@ -22,6 +22,7 @@ from gemini_web2api.config import CONFIG
 from gemini_web2api.cookies import cookie_pairs_from_content
 from gemini_web2api.tools import (
     agent_delta_to_prompt,
+    google_contents_to_messages,
     messages_to_prompt,
     parse_tool_calls,
     strip_tool_call_protocol,
@@ -92,7 +93,9 @@ class HttpHarness:
             "max_history_messages": 20,
             "max_history_chars": 10000,
             "max_google_prompt_chars": 18000,
+            "max_google_agent_prompt_chars": 40000,
             "google_stream_auto_tools": False,
+            "google_stream_auto_agent_tools": True,
             "reuse_upstream_sessions": reuse_upstream_sessions,
             "reuse_upstream_agent_sessions": reuse_upstream_agent_sessions,
             "agent_use_webapi": False,
@@ -1865,6 +1868,178 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(data_events[-1]["candidates"][0]["finishReason"], "STOP")
                 self.assertEqual(len(harness.prompts), 1)
                 self.assertNotIn("# Tool Use", harness.prompts[0])
+            finally:
+                harness.close()
+
+    def test_google_stream_keeps_tools_for_converted_claude_agent(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                'function_call\n{"name":"shell_command","args":{"command":"pwd"}}',
+            ])
+            try:
+                events = harness.post_sse(
+                    "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+                    {
+                        "systemInstruction": {"parts": [{"text": (
+                            "x-anthropic-billing-header: enabled\n"
+                            "You are a Claude agent working through the Claude Agent SDK."
+                        )}]},
+                        "contents": [{"role": "user", "parts": [{
+                            "text": "创建一个可以部署到 Cloudflare 的火星页面",
+                        }]}],
+                        "tools": GOOGLE_TOOLS,
+                        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                    },
+                )
+                data_events = [e["data"] for e in events if isinstance(e["data"], dict)]
+                function_call = data_events[0]["candidates"][0]["content"]["parts"][0]["functionCall"]
+                self.assertEqual(function_call["name"], "shell_command")
+                self.assertEqual(function_call["args"]["command"], "pwd")
+                self.assertEqual(len(harness.prompts), 1)
+                self.assertIn("# Tool Use", harness.prompts[0])
+            finally:
+                harness.close()
+
+    def test_google_stream_keeps_tools_for_converted_codex_and_copilot(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                'function_call\n{"name":"shell_command","args":{"command":"pwd"}}',
+                'function_call\n{"name":"shell_command","args":{"command":"pwd"}}',
+            ])
+            try:
+                for marker in ("You are Codex, an AI coding agent.", "You are GitHub Copilot coding agent."):
+                    events = harness.post_sse(
+                        "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+                        {
+                            "systemInstruction": {"parts": [{"text": marker}]},
+                            "contents": [{"role": "user", "parts": [{
+                                "text": "检查当前项目并执行必要操作",
+                            }]}],
+                            "tools": GOOGLE_TOOLS,
+                            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                        },
+                    )
+                    data_events = [e["data"] for e in events if isinstance(e["data"], dict)]
+                    function_call = data_events[0]["candidates"][0]["content"]["parts"][0]["functionCall"]
+                    self.assertEqual(function_call["name"], "shell_command")
+                self.assertEqual(len(harness.prompts), 2)
+                self.assertTrue(all("# Tool Use" in prompt for prompt in harness.prompts))
+            finally:
+                harness.close()
+
+    def test_google_function_response_reuses_stable_call_id(self):
+        request = {
+            "contents": [
+                {"role": "model", "parts": [{"functionCall": {
+                    "name": "shell_command", "args": {"command": "pwd"},
+                }}]},
+                {"role": "user", "parts": [{"functionResponse": {
+                    "name": "shell_command", "response": {"output": "/workspace"},
+                }}]},
+            ],
+        }
+        messages = google_contents_to_messages(request)
+        assistant = next(message for message in messages if message.get("role") == "assistant")
+        tool = next(message for message in messages if message.get("role") == "tool")
+        call_id = assistant["tool_calls"][0]["id"]
+        self.assertTrue(call_id.startswith("call_g_"))
+        self.assertEqual(tool["tool_call_id"], call_id)
+        self.assertEqual(
+            google_contents_to_messages(request)[0]["tool_calls"][0]["id"],
+            call_id,
+        )
+
+    def test_google_stream_keeps_agent_title_request_tool_free(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, ["Mars page"], reuse_upstream_sessions=False)
+            try:
+                events = harness.post_sse(
+                    "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+                    {
+                        "systemInstruction": {"parts": [{"text": (
+                            "You are a Claude agent. You are coming up with a succinct title "
+                            "for an agent chat session."
+                        )}]},
+                        "contents": [{"role": "user", "parts": [{"text": "创建火星网页"}]}],
+                        "tools": GOOGLE_TOOLS,
+                        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                    },
+                )
+                data_events = [e["data"] for e in events if isinstance(e["data"], dict)]
+                self.assertEqual(
+                    data_events[0]["candidates"][0]["content"]["parts"][0]["text"],
+                    "Mars page",
+                )
+                self.assertNotIn("# Tool Use", harness.prompts[0])
+            finally:
+                harness.close()
+
+    def test_google_agent_reuses_session_after_function_response(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            harness = HttpHarness(tmpdir, [
+                'function_call\n{"name":"shell_command","args":{"command":"pwd"}}',
+                'function_call\n{"name":"shell_command","args":{"command":"ls"}}',
+            ], reuse_upstream_agent_sessions=True)
+            try:
+                base_request = {
+                    "systemInstruction": {"parts": [{"text": (
+                        "x-anthropic-billing-header: enabled\n"
+                        "You are a Claude agent working through the Claude Agent SDK."
+                    )}]},
+                    "tools": GOOGLE_TOOLS,
+                    "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                }
+                first = harness.post("/v1beta/models/gemini-3.5-flash:generateContent", {
+                    **base_request,
+                    "contents": [{"role": "user", "parts": [{"text": "检查当前项目"}]}],
+                })
+                self.assertEqual(
+                    first["candidates"][0]["content"]["parts"][0]["functionCall"]["name"],
+                    "shell_command",
+                )
+                second = harness.post("/v1beta/models/gemini-3.5-flash:generateContent", {
+                    **base_request,
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "检查当前项目"}]},
+                        {"role": "model", "parts": [{"functionCall": {
+                            "name": "shell_command", "args": {"command": "pwd"},
+                        }}]},
+                        {"role": "user", "parts": [{"functionResponse": {
+                            "name": "shell_command", "response": {"output": "/workspace"},
+                        }}]},
+                    ],
+                })
+                self.assertEqual(
+                    second["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["command"],
+                    "ls",
+                )
+                self.assertEqual(len(harness.prompts), 2)
+                self.assertIn("Trusted agent-runtime tool result", harness.prompts[1])
+                self.assertNotIn("Claude Agent SDK", harness.prompts[1])
+                self.assertNotIn("Available tools", harness.prompts[1])
+            finally:
+                harness.close()
+
+    def test_google_agent_falls_back_to_tool_instead_of_manual_code(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            manual_reply = "请在本地创建 index.html，然后手动复制下面的代码。"
+            harness = HttpHarness(tmpdir, [manual_reply, manual_reply])
+            try:
+                response = harness.post("/v1beta/models/gemini-3.5-flash:generateContent", {
+                    "systemInstruction": {"parts": [{"text": (
+                        "x-anthropic-billing-header: enabled\n"
+                        "You are a Claude agent working through the Claude Agent SDK."
+                    )}]},
+                    "contents": [{"role": "user", "parts": [{
+                        "text": "创建一个可部署到 Cloudflare 的火星页面",
+                    }]}],
+                    "tools": GOOGLE_TOOLS,
+                    "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                })
+                parts = response["candidates"][0]["content"]["parts"]
+                self.assertEqual(parts[0]["functionCall"]["name"], "shell_command")
+                self.assertEqual(parts[0]["functionCall"]["args"]["command"], "pwd; ls")
+                self.assertEqual(len(harness.prompts), 2)
             finally:
                 harness.close()
 

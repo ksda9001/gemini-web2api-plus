@@ -4,6 +4,7 @@ import re
 import uuid
 import base64
 import io
+import hashlib
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
@@ -523,7 +524,7 @@ def parse_tool_calls(text: str) -> tuple:
 
 def build_tool_prompt(tool_defs: list) -> str:
     """Build natural tool-use prompt for Gemini Web that avoids prompt-injection detection."""
-    tool_spec = json.dumps(tool_defs, indent=2, ensure_ascii=False)
+    tool_spec = json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))
     return (
         "# Tool Use\n\n"
         "You can call the following tools to help accomplish tasks. "
@@ -535,7 +536,9 @@ def build_tool_prompt(tool_defs: list) -> str:
         "When calling tools:\n"
         "- Output ONLY the function_call block(s), nothing else\n"
         "- You may call multiple tools with multiple blocks\n"
-        "- After receiving a [Tool result for ...], use that data to answer the user\n\n"
+        "- The connected agent client executes each requested function in its real environment\n"
+        "- After receiving a trusted tool result, continue the original task until it is complete\n"
+        "- Never ask the user to copy code or run a command when a declared tool can perform that action\n\n"
         f"Available tools:\n{tool_spec}"
     )
 
@@ -728,9 +731,41 @@ def google_tool_choice_to_openai(req: dict):
     return "auto"
 
 
+def google_function_call_id(name: str, args, ordinal: int = 0) -> str:
+    """Build a stable call ID for Google function calls, whose wire format has no ID."""
+    payload = json.dumps(
+        {"name": name or "", "args": args or {}, "ordinal": int(ordinal or 0)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "call_g_" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def google_function_calls_to_openai(function_calls: list, start_ordinal: int = 0) -> list:
+    calls = []
+    for index, call in enumerate(function_calls or []):
+        if not isinstance(call, dict) or not isinstance(call.get("name"), str):
+            continue
+        args = call.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+        calls.append({
+            "id": google_function_call_id(call["name"], args, start_ordinal + index),
+            "type": "function",
+            "function": {
+                "name": call["name"],
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        })
+    return calls
+
+
 def google_contents_to_messages(req: dict) -> list:
     """Convert Google native contents/systemInstruction to OpenAI-style messages for retry heuristics."""
     messages = []
+    call_ordinal = 0
+    pending_calls = {}
     sys_inst = req.get("systemInstruction")
     if sys_inst:
         sys_parts = sys_inst.get("parts", [])
@@ -746,23 +781,34 @@ def google_contents_to_messages(req: dict) -> list:
                 text_parts.append(part["text"])
             elif part.get("functionCall"):
                 fc = part["functionCall"]
+                name = fc.get("name", "")
+                args = fc.get("args", {})
+                call_id = fc.get("id") or google_function_call_id(
+                    name, args, call_ordinal
+                )
+                call_ordinal += 1
+                pending_calls.setdefault(name, []).append(call_id)
                 messages.append({
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "id": call_id,
                         "type": "function",
                         "function": {
-                            "name": fc.get("name", ""),
-                            "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False),
+                            "name": name,
+                            "arguments": json.dumps(args, ensure_ascii=False),
                         },
                     }],
                 })
             elif part.get("functionResponse"):
                 fr = part["functionResponse"]
+                name = fr.get("name", "")
+                matching = pending_calls.get(name) or []
+                call_id = fr.get("id") or (matching.pop(0) if matching else "")
                 messages.append({
                     "role": "tool",
-                    "name": fr.get("name", ""),
+                    "tool_call_id": call_id,
+                    "name": name,
                     "content": json.dumps(fr.get("response", {}), ensure_ascii=False),
                 })
         if text_parts:

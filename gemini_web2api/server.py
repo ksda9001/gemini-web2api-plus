@@ -13,6 +13,7 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, generate_with_state, log
 from .tools import (
     build_google_tool_retry_prompt,
+    google_function_calls_to_openai,
     google_contents_to_messages,
     google_contents_to_prompt,
     google_tool_choice_to_openai,
@@ -52,6 +53,21 @@ OPEN_WEBUI_BACKGROUND_TASK_MARKERS = (
     "Generate 1-3 broad tags categorizing the main themes of the chat history",
     "Suggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next",
     "Generate a detailed prompt for am image generation task based on the given language and context.",
+    "You are coming up with a succinct title for an agent chat session",
+    "Generate a concise UI title (up to 36 characters) for this task.",
+)
+
+GOOGLE_AGENT_SYSTEM_MARKERS = (
+    "x-anthropic-billing-header:",
+    "cc_entrypoint=",
+    "you are a claude agent",
+    "claude agent sdk",
+    "you are claude code",
+    "you are codex",
+    "openai codex",
+    "github copilot",
+    "copilot coding agent",
+    "you are an ai coding agent",
 )
 
 
@@ -60,6 +76,45 @@ def _is_background_metadata_prompt(prompt: str) -> bool:
     if not CONFIG.get("temporary_background_tasks", True) or not isinstance(prompt, str):
         return False
     return any(marker in prompt for marker in OPEN_WEBUI_BACKGROUND_TASK_MARKERS)
+
+
+def _google_request_text(req: dict) -> str:
+    """Collect classification text without injecting or logging tool schemas."""
+    parts = []
+    system = req.get("systemInstruction") or {}
+    for part in system.get("parts", []) if isinstance(system, dict) else []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    for content in req.get("contents", []) or []:
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts", []) or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "\n".join(parts)
+
+
+def _is_google_agent_request(req: dict) -> bool:
+    """Recognize coding-agent prompts translated to Google by API gateways."""
+    system = req.get("systemInstruction") or {}
+    system_text = "\n".join(
+        part.get("text", "")
+        for part in (system.get("parts", []) if isinstance(system, dict) else [])
+        if isinstance(part, dict)
+    ).lower()
+    return any(marker in system_text for marker in GOOGLE_AGENT_SYSTEM_MARKERS)
+
+
+def _trim_google_prompt(prompt: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(prompt) <= max_chars:
+        return prompt
+    head_chars = min(2048, max(0, max_chars // 5))
+    marker = (
+        f"\n\n[Earlier Google native context omitted: "
+        f"{len(prompt) - max_chars} characters.]\n\n"
+    )
+    tail_chars = max(1, max_chars - head_chars)
+    return prompt[:head_chars] + marker + prompt[-tail_chars:]
 
 
 def _response_store() -> ResponseStore:
@@ -225,6 +280,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if delta_prompt.strip():
                 return delta_prompt, session["upstream_state"]
         return full_prompt, None
+
+    def _prepare_google_agent_turn(
+        self, messages: list, full_prompt: str, model_name: str
+    ):
+        """Resume an agent request converted to Google native format by a gateway."""
+        session = (
+            _response_store().find_agent_session(model_name, messages)
+            if (
+                CONFIG.get("reuse_upstream_sessions", False)
+                and CONFIG.get("reuse_upstream_agent_sessions", False)
+            )
+            else {}
+        )
+        if session:
+            delta_prompt = agent_delta_to_prompt(
+                session["delta_messages"], messages
+            )
+            if delta_prompt.strip():
+                return delta_prompt, session["upstream_state"], True
+        return full_prompt, None, False
 
     def _save_conversation_turn(
         self, model_name: str, upstream_state: dict, input_messages: list,
@@ -1190,7 +1265,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_config = req.get("toolConfig", {})
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
-        if stream and fc_mode == "AUTO" and not CONFIG.get("google_stream_auto_tools", False):
+        request_text = _google_request_text(req)
+        temporary = _is_background_metadata_prompt(request_text)
+        converted_agent = (
+            bool(CONFIG.get("google_stream_auto_agent_tools", True))
+            and _is_google_agent_request(req)
+            and not temporary
+        )
+        allow_stream_auto_tools = bool(
+            CONFIG.get("google_stream_auto_tools", False) or converted_agent
+        )
+        if stream and fc_mode == "AUTO" and not allow_stream_auto_tools:
             req = dict(req)
             req["tools"] = []
             has_tools = False
@@ -1201,20 +1286,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not full_prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
-        temporary = _is_background_metadata_prompt(full_prompt)
-        max_google_prompt_chars = int(CONFIG.get("max_google_prompt_chars", 18000) or 0)
-        if max_google_prompt_chars > 0 and len(full_prompt) > max_google_prompt_chars:
-            omitted = len(full_prompt) - max_google_prompt_chars
-            full_prompt = (
-                f"[Earlier Google native context omitted: {omitted} characters. "
-                "Continue using the recent conversation below.]\n\n"
-                + full_prompt[-max_google_prompt_chars:]
+        max_google_prompt_chars = int(
+            CONFIG.get(
+                "max_google_agent_prompt_chars" if has_tools else "max_google_prompt_chars",
+                40000 if has_tools else 18000,
             )
+            or 0
+        )
+        full_prompt = _trim_google_prompt(full_prompt, max_google_prompt_chars)
 
-        file_refs = _upload_images(images)
+        file_refs = _upload_images(images) if not has_tools else None
         upstream_state = None
         prompt = full_prompt
-        if not has_tools and not file_refs:
+        resumed = False
+        if has_tools:
+            prompt, upstream_state, resumed = self._prepare_google_agent_turn(
+                google_messages, full_prompt, model_name
+            )
+        elif not file_refs:
             prompt, upstream_state = self._prepare_google_plain_turn(
                 google_messages,
                 full_prompt,
@@ -1223,7 +1312,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             )
         log(
             f"Google API: model={model_name} stream={stream} tools={has_tools} "
-            f"temporary={temporary} resumed={bool(upstream_state)} "
+            f"agent_client={converted_agent} temporary={temporary} "
+            f"resumed={resumed or bool(upstream_state)} "
             f"prompt_len={len(prompt)} fallback_len={len(full_prompt)}"
         )
 
@@ -1320,68 +1410,140 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             return
 
-        try:
-            text, upstream_state, usage_prompt = generate_with_state(
-                prompt,
-                model_id,
-                think_mode,
-                file_refs,
-                extra_fields,
-                upstream_state,
-                full_prompt,
-                model_name=model_name,
-                temporary=temporary,
+        stream_started = False
+        if has_tools and stream:
+            self._start_sse()
+            stream_started = True
+
+        fallback_used = False
+        openai_calls = []
+        usage_prompt = prompt
+        if has_tools:
+            try:
+                text, upstream_state, usage_prompt = self._generate_agent_turn(
+                    prompt,
+                    full_prompt,
+                    model_id,
+                    think_mode,
+                    model_name,
+                    images,
+                    extra_fields,
+                    upstream_state,
+                    stream_started,
+                )
+            except Exception as e:
+                openai_calls = fallback_tool_call(google_messages, tools, tool_choice) or []
+                if openai_calls:
+                    log(f"Google Agent upstream failed; returning safe tool fallback: {e}")
+                    text = ""
+                    upstream_state = {}
+                    usage_prompt = full_prompt
+                    fallback_used = True
+                else:
+                    error = {"error": {"message": f"upstream error: {e}"}}
+                    if stream_started:
+                        self.wfile.write(
+                            f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode()
+                        )
+                        self.wfile.flush()
+                    else:
+                        self.send_json(error, 502)
+                    return
+
+            text = sanitize_model_text(text)
+            clean_text, function_calls = parse_google_function_calls(text or "")
+            existing_call_count = sum(
+                len(message.get("tool_calls") or [])
+                for message in google_messages
+                if isinstance(message, dict)
             )
-        except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
-
-        if not text:
-            log("Warning: empty response from Gemini")
-        text = sanitize_model_text(text)
-
-        response_parts = []
-        function_calls = []
-        if has_tools and text:
-            clean_text, function_calls = parse_google_function_calls(text)
-            if not function_calls and should_retry_tool_call(google_messages, tools, tool_choice, text, function_calls):
+            if not fallback_used:
+                openai_calls = filter_tool_calls(
+                    google_function_calls_to_openai(function_calls, existing_call_count),
+                    tools,
+                )
+            if not fallback_used and should_retry_tool_call(
+                google_messages, tools, tool_choice, clean_text, openai_calls
+            ):
                 for _ in range(int(CONFIG.get("tool_retry_attempts", 1) or 0)):
-                    retry_prompt = build_google_tool_retry_prompt(prompt, req)
                     try:
-                        retry_text, upstream_state, _ = generate_with_state(
-                            retry_prompt,
+                        retry_text, upstream_state, retry_usage_prompt = self._generate_agent_turn(
+                            build_google_tool_retry_prompt("", req),
+                            build_google_tool_retry_prompt(full_prompt, req),
                             model_id,
                             think_mode,
-                            file_refs,
+                            model_name,
+                            images,
                             extra_fields,
                             upstream_state,
-                            build_google_tool_retry_prompt(full_prompt, req),
-                            model_name=model_name,
-                            temporary=temporary,
+                            stream_started,
                         )
+                        usage_prompt += "\n" + retry_usage_prompt
                     except Exception:
                         break
                     retry_clean, retry_calls = parse_google_function_calls(retry_text or "")
-                    if retry_calls:
-                        text, clean_text, function_calls = retry_text, retry_clean, retry_calls
+                    retry_openai_calls = filter_tool_calls(
+                        google_function_calls_to_openai(retry_calls, existing_call_count),
+                        tools,
+                    )
+                    if retry_openai_calls:
+                        text, clean_text, openai_calls = retry_text, retry_clean, retry_openai_calls
                         break
-            if function_calls:
-                for fc in function_calls:
-                    response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
+            if not fallback_used and not openai_calls:
+                openai_calls = fallback_tool_call(google_messages, tools, tool_choice) or []
+                if openai_calls:
+                    clean_text = ""
+                    fallback_used = True
+
+            assistant_message = {"role": "assistant", "content": clean_text or None}
+            if openai_calls:
+                assistant_message["tool_calls"] = openai_calls
+            self._save_agent_turn(
+                model_name,
+                upstream_state,
+                google_messages,
+                assistant_message,
+                fallback_used,
+            )
+            response_parts = []
+            if openai_calls:
+                for call in openai_calls:
+                    function = call.get("function", {})
+                    response_parts.append({"functionCall": {
+                        "name": function.get("name", ""),
+                        "args": self._safe_json_object(function.get("arguments")),
+                    }})
             elif clean_text:
                 response_parts.append({"text": clean_text})
             else:
                 response_parts.append({"text": text or ""})
         else:
-            response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
-
-        if not has_tools and not temporary:
-            self._save_conversation_turn(
-                model_name,
-                upstream_state,
-                google_messages,
-                {"role": "assistant", "content": text or ""},
-            )
+            try:
+                text, upstream_state, usage_prompt = generate_with_state(
+                    prompt,
+                    model_id,
+                    think_mode,
+                    file_refs,
+                    extra_fields,
+                    upstream_state,
+                    full_prompt,
+                    model_name=model_name,
+                    temporary=temporary,
+                )
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+            if not text:
+                log("Warning: empty response from Gemini")
+            text = sanitize_model_text(text)
+            response_parts = [{"text": text or "I apologize, but I was unable to generate a response. Please try again."}]
+            if not temporary:
+                self._save_conversation_turn(
+                    model_name,
+                    upstream_state,
+                    google_messages,
+                    {"role": "assistant", "content": text or ""},
+                )
 
         candidate = {
             "content": {"parts": response_parts, "role": "model"},
@@ -1389,9 +1551,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "index": 0,
         }
         usage = {
-            "promptTokenCount": len(prompt) // 4,
+            "promptTokenCount": len(usage_prompt) // 4,
             "candidatesTokenCount": len(text or "") // 4,
-            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
+            "totalTokenCount": (len(usage_prompt) + len(text or "")) // 4,
         }
         response_obj = {
             "candidates": [candidate],
@@ -1400,7 +1562,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         }
 
         if stream:
-            self._start_sse()
+            if not stream_started:
+                self._start_sse()
             self.wfile.write(f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         else:
