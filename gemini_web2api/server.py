@@ -262,6 +262,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             fallback_prompt,
             model_name=model_name,
             allow_webapi=bool(CONFIG.get("agent_use_webapi", False)),
+            request_timeout_sec=CONFIG.get("agent_request_timeout_sec", 75),
+            retry_attempts=CONFIG.get("agent_retry_attempts", 1),
         )
         return self._run_with_sse_heartbeats(callback) if stream_started else callback()
 

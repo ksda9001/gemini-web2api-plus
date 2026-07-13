@@ -324,6 +324,7 @@ def _request_text(
     extra_fields=None,
     conversation: dict = None,
     temporary: bool = False,
+    timeout_sec: int = None,
 ) -> tuple:
     body = _build_payload(
         prompt, model_id, think_mode, file_refs, extra_fields, conversation, temporary
@@ -332,15 +333,16 @@ def _request_text(
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    timeout_sec = max(1, int(timeout_sec or CONFIG["request_timeout_sec"]))
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     if proxy:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
             urllib.request.HTTPSHandler(context=ctx),
         )
-        resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+        resp = opener.open(req, timeout=timeout_sec)
     else:
-        resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+        resp = urllib.request.urlopen(req, context=ctx, timeout=timeout_sec)
     raw = resp.read().decode("utf-8", errors="replace")
     return extract_response_text(raw), _was_truncated(raw), _extract_conversation_state(raw)
 
@@ -356,6 +358,8 @@ def generate_with_state(
     model_name: str = None,
     temporary: bool = False,
     allow_webapi: bool = True,
+    request_timeout_sec: int = None,
+    retry_attempts: int = None,
 ) -> tuple:
     """Generate text and return Gemini Web conversation state for the next turn."""
     session_backend = CONFIG.get("upstream_session_backend", "direct")
@@ -396,7 +400,9 @@ def generate_with_state(
     last_err = None
     active_conversation = conversation
     active_prompt = prompt
-    for attempt in range(CONFIG["retry_attempts"]):
+    request_timeout_sec = max(1, int(request_timeout_sec or CONFIG["request_timeout_sec"]))
+    retry_attempts = max(1, int(retry_attempts or CONFIG["retry_attempts"]))
+    for attempt in range(retry_attempts):
         try:
             text, truncated, state = _request_text(
                 active_prompt,
@@ -406,6 +412,7 @@ def generate_with_state(
                 extra_fields,
                 active_conversation,
                 temporary,
+                timeout_sec=request_timeout_sec,
             )
             if not text:
                 raise RuntimeError("Gemini upstream returned an empty response")
@@ -417,8 +424,8 @@ def generate_with_state(
                 active_conversation = None
                 active_prompt = fallback_prompt
                 continue
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            if attempt < retry_attempts - 1:
+                log(f"Retry {attempt+1}/{retry_attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     else:
         raise last_err
@@ -429,7 +436,7 @@ def generate_with_state(
         log(f"Upstream output truncated; requesting continuation {continuation_index + 1}")
         continuation_prompt = _continuation_prompt(prompt, text)
         continuation = ""
-        for attempt in range(CONFIG["retry_attempts"]):
+        for attempt in range(retry_attempts):
             try:
                 continuation, truncated, continuation_state = _request_text(
                     continuation_prompt,
@@ -439,14 +446,15 @@ def generate_with_state(
                     extra_fields,
                     state,
                     temporary,
+                    timeout_sec=request_timeout_sec,
                 )
                 if not continuation:
                     raise RuntimeError("Gemini continuation returned an empty response")
                 break
             except Exception as e:
                 last_err = e
-                if attempt < CONFIG["retry_attempts"] - 1:
-                    log(f"Continuation retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                if attempt < retry_attempts - 1:
+                    log(f"Continuation retry {attempt+1}/{retry_attempts}: {e}")
                     time.sleep(CONFIG["retry_delay_sec"])
         if not continuation:
             raise last_err

@@ -602,8 +602,19 @@ class AgentCompatTests(unittest.TestCase):
 
     def test_agent_turn_disables_webapi_by_default(self):
         handler = object.__new__(server.GeminiHandler)
-        previous = CONFIG.get("agent_use_webapi")
-        CONFIG["agent_use_webapi"] = False
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "agent_use_webapi",
+                "agent_request_timeout_sec",
+                "agent_retry_attempts",
+            )
+        }
+        CONFIG.update({
+            "agent_use_webapi": False,
+            "agent_request_timeout_sec": 37,
+            "agent_retry_attempts": 1,
+        })
         try:
             with patch.object(
                 server,
@@ -622,9 +633,34 @@ class AgentCompatTests(unittest.TestCase):
                     False,
                 )
         finally:
-            CONFIG["agent_use_webapi"] = previous
+            CONFIG.update(previous)
         self.assertEqual((text, state, usage), ("tool call", {}, "prompt"))
         self.assertFalse(generate.call_args.kwargs["allow_webapi"])
+        self.assertEqual(generate.call_args.kwargs["request_timeout_sec"], 37)
+        self.assertEqual(generate.call_args.kwargs["retry_attempts"], 1)
+
+    def test_generate_with_state_honors_agent_timeout_and_retry_overrides(self):
+        previous = CONFIG.get("retry_attempts")
+        CONFIG["retry_attempts"] = 3
+        try:
+            with patch.object(
+                gemini,
+                "_request_text",
+                side_effect=RuntimeError("upstream stalled"),
+            ) as direct_request:
+                with self.assertRaisesRegex(RuntimeError, "upstream stalled"):
+                    gemini.generate_with_state(
+                        "tool prompt",
+                        1,
+                        0,
+                        allow_webapi=False,
+                        request_timeout_sec=7,
+                        retry_attempts=1,
+                    )
+        finally:
+            CONFIG["retry_attempts"] = previous
+        self.assertEqual(direct_request.call_count, 1)
+        self.assertEqual(direct_request.call_args.kwargs["timeout_sec"], 7)
 
     def test_generate_with_state_forwards_temporary_to_webapi(self):
         previous = {

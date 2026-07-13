@@ -29,6 +29,8 @@
   "upstream_session_fallback_direct": true,
   "reuse_upstream_agent_sessions": false,
   "agent_use_webapi": false,
+  "agent_request_timeout_sec": 75,
+  "agent_retry_attempts": 1,
   "cookie_cache_path": "/app/data/gemini_cookies",
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,

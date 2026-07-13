@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
     "upstream_session_fallback_direct": True,
     "reuse_upstream_agent_sessions": False,
     "agent_use_webapi": False,
+    "agent_request_timeout_sec": 75,
+    "agent_retry_attempts": 1,
     "cookie_cache_path": "/app/data/gemini_cookies",
     "cookie_auto_refresh": True,
     "cookie_refresh_interval_sec": 600,

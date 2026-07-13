@@ -239,6 +239,8 @@ Create `config.json` in the same directory:
   "upstream_session_fallback_direct": true,
   "reuse_upstream_agent_sessions": false,
   "agent_use_webapi": false,
+  "agent_request_timeout_sec": 75,
+  "agent_retry_attempts": 1,
   "cookie_cache_path": "/app/data/gemini_cookies",
   "cookie_auto_refresh": true,
   "cookie_refresh_interval_sec": 600,
@@ -261,11 +263,12 @@ Agent-related config:
 - `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
-- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for Chat Completions, Claude Messages, Codex Responses, Google-native `/v1beta` plain chats, and agent tool loops. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
+- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for Chat Completions, Claude Messages, Codex Responses, and Google-native `/v1beta` plain chats. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
 - `upstream_session_backend`: `gemini_webapi` uses dynamic page tokens/model headers and cookie refresh; `direct` retains the legacy request builder
 - `upstream_session_fallback_direct`: replay full history through the direct backend if the primary backend cannot initialize or resume
 - `reuse_upstream_agent_sessions`: keep this `false` by default. Plain chats safely reuse Gemini Web metadata; agent tool-result turns use the direct backend with their complete compacted tool history because Gemini Web conversation resumption can stall on synthetic tool protocols
 - `agent_use_webapi`: keep this `false` by default. Agent tool decisions use the direct backend; it is more reliable for the synthetic tool-call protocol than Gemini Web's chat-session renderer
+- `agent_request_timeout_sec` / `agent_retry_attempts`: direct-backend limits used only by Agent turns. The defaults (`75` seconds, `1` attempt) avoid spending several minutes on a stalled Gemini request before returning a conservative declared-tool fallback; ordinary chat retains `request_timeout_sec` and `retry_attempts`
 - `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: rotate and persist `__Secure-1PSIDTS` in the background
 - `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
