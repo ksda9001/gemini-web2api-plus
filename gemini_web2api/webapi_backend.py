@@ -255,8 +255,9 @@ class GeminiWebAPIBackend:
         model_name: str,
         state: dict = None,
         temporary: bool = False,
+        timeout_sec: int = None,
     ) -> tuple:
-        timeout = _request_timeout()
+        timeout = max(1, int(timeout_sec or _request_timeout()))
         future = self._submit(self._generate(prompt, model_name, state, temporary))
         try:
             return future.result(timeout=timeout)
@@ -319,8 +320,9 @@ def generate_with_state(
     model_name: str,
     state: dict = None,
     temporary: bool = False,
+    timeout_sec: int = None,
 ) -> tuple:
-    return backend().generate(prompt, model_name, state, temporary)
+    return backend().generate(prompt, model_name, state, temporary, timeout_sec)
 
 
 def generate_stream_with_state(

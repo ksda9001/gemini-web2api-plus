@@ -185,6 +185,100 @@ def messages_to_prompt(
     return prompt, images
 
 
+def _agent_tool_call_index(messages: list) -> dict:
+    calls = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id") or call.get("call_id")
+            function = call.get("function", {})
+            if call_id and isinstance(function, dict):
+                calls[call_id] = {
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments", "{}"),
+                }
+    return calls
+
+
+def _json_tool_arguments(arguments):
+    if not isinstance(arguments, str):
+        return arguments if arguments is not None else {}
+    try:
+        return json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+
+
+def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> str:
+    """Encode only new external tool events for a resumed Gemini Web chat."""
+    call_index = _agent_tool_call_index(all_messages or delta_messages)
+    parts = []
+    has_tool_event = False
+
+    for message in delta_messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "user")
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            has_tool_event = True
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function", {})
+                event = {
+                    "call_id": call.get("id") or call.get("call_id") or "",
+                    "tool": function.get("name", "") if isinstance(function, dict) else "",
+                    "arguments": _json_tool_arguments(
+                        function.get("arguments", "{}") if isinstance(function, dict) else "{}"
+                    ),
+                }
+                parts.append(
+                    "[External tool call accepted by the agent client]\n"
+                    + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                )
+
+        if role == "tool":
+            has_tool_event = True
+            call_id = message.get("tool_call_id", "")
+            known_call = call_index.get(call_id, {})
+            message_name = message.get("name", "")
+            event = {
+                "call_id": call_id,
+                "tool": known_call.get("name") or (
+                    message_name if message_name != call_id else ""
+                ),
+                "arguments": _json_tool_arguments(known_call.get("arguments", "{}")),
+            }
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            parts.append(
+                "[External tool execution result]\n"
+                + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                + "\noutput:\n"
+                + content
+                + "\n[/External tool execution result]"
+            )
+        elif not tool_calls:
+            generic, _ = messages_to_prompt(
+                [message], None, "none", include_agent_instruction=False
+            )
+            if generic.strip():
+                parts.append(generic)
+
+    if has_tool_event:
+        parts.append(
+            "[System instruction]: These are external tool events for the pending task in this same conversation. "
+            "Continue from the original task using the tool definitions already provided. Return another tool call "
+            "when more environment work is needed; otherwise return the final answer. Do not echo the event envelope."
+        )
+    return "\n\n".join(parts)
+
+
 def _tool_arguments_to_json(arguments) -> str:
     if arguments is None:
         return "{}"

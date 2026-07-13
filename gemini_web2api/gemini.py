@@ -358,39 +358,66 @@ def generate_with_state(
     model_name: str = None,
     temporary: bool = False,
     allow_webapi: bool = True,
+    agent_mode: bool = False,
+    rebuild_webapi_on_failure: bool = False,
     request_timeout_sec: int = None,
     retry_attempts: int = None,
 ) -> tuple:
     """Generate text and return Gemini Web conversation state for the next turn."""
     session_backend = CONFIG.get("upstream_session_backend", "direct")
+    conversation_backend = (conversation or {}).get("backend")
+    valid_webapi_state = (
+        not conversation
+        or conversation_backend in (None, "gemini_webapi")
+        or (
+            CONFIG.get("reuse_upstream_agent_sessions", False)
+            and conversation_backend == "gemini_webapi_agent"
+        )
+    )
     can_use_webapi = (
         allow_webapi
-        and
-        CONFIG.get("reuse_upstream_sessions", False)
+        and CONFIG.get("reuse_upstream_sessions", False)
         and session_backend == "gemini_webapi"
         and not file_refs
-        and (
-            CONFIG.get("reuse_upstream_agent_sessions", False)
-            or not conversation
-            or conversation.get("backend") != "gemini_webapi_agent"
-        )
-        and (not conversation or conversation.get("backend") in (None, "gemini_webapi"))
+        and valid_webapi_state
     )
     if can_use_webapi:
-        try:
-            from .webapi_backend import generate_with_state as webapi_generate
+        from .webapi_backend import generate_with_state as webapi_generate
 
-            selected_name = model_name or CONFIG.get("default_model", "gemini-3.5-flash")
+        selected_name = model_name or CONFIG.get("default_model", "gemini-3.5-flash")
+        webapi_kwargs = {"temporary": temporary}
+        if request_timeout_sec is not None:
+            webapi_kwargs["timeout_sec"] = request_timeout_sec
+        try:
             text, state = webapi_generate(
                 prompt,
                 selected_name,
                 conversation,
-                temporary=temporary,
+                **webapi_kwargs,
             )
             if not text:
                 raise RuntimeError("Gemini webapi backend returned an empty response")
+            if agent_mode:
+                state = dict(state or {})
+                state["backend"] = "gemini_webapi_agent"
             return text, state, prompt
         except Exception as e:
+            if agent_mode and conversation and fallback_prompt and rebuild_webapi_on_failure:
+                log(f"Gemini agent Web resume failed; rebuilding Web conversation: {e}")
+                try:
+                    text, state = webapi_generate(
+                        fallback_prompt,
+                        selected_name,
+                        None,
+                        **webapi_kwargs,
+                    )
+                    if not text:
+                        raise RuntimeError("rebuilt Gemini Web conversation returned an empty response")
+                    state = dict(state or {})
+                    state["backend"] = "gemini_webapi_agent"
+                    return text, state, fallback_prompt
+                except Exception as rebuild_error:
+                    log(f"Gemini agent Web rebuild failed; using direct backend: {rebuild_error}")
             if not CONFIG.get("upstream_session_fallback_direct", True):
                 raise
             log(f"Gemini webapi session failed; rebuilding through direct backend: {e}")

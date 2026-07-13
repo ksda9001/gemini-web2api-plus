@@ -125,6 +125,18 @@ def sanitize_model_text(text: str) -> str:
     if not text:
         return text or ""
     cleaned = re.sub(r"(?ms)^\s*\[Tool result for [^\]]+\]:.*?(?:\n\s*\n|\Z)", "", text)
+    cleaned = re.sub(
+        r"(?ms)^\s*\[External tool execution result\].*?"
+        r"\[/External tool execution result\]\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?ms)^\s*\[External tool call accepted by the agent client\]\s*"
+        r"\{.*?\}\s*",
+        "",
+        cleaned,
+    )
     cleaned = re.sub(r"(?m)^\s*\[Assistant\]:\s*", "", cleaned)
     return cleaned.strip()
 

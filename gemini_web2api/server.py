@@ -17,6 +17,7 @@ from .tools import (
     google_contents_to_prompt,
     google_tool_choice_to_openai,
     google_tools_to_openai,
+    agent_delta_to_prompt,
     messages_to_prompt,
     openai_tool_choice_from_request,
     openai_tools_from_request,
@@ -162,6 +163,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return next(self._iter_with_sse_heartbeats(one_result()))
 
     def _prepare_agent_turn(self, messages: list, tools: list, tool_choice, model_name: str):
+        # The behavior instruction is present only on a real first tool turn.
+        # A recovery rebuild still receives compact history and the tool schema.
         full_prompt, images = messages_to_prompt(messages, tools, tool_choice)
         session = (
             _response_store().find_agent_session(model_name, messages)
@@ -173,11 +176,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             else {}
         )
         if session:
-            delta_prompt, _ = messages_to_prompt(
+            delta_prompt = agent_delta_to_prompt(
                 session["delta_messages"],
-                None,
-                "none",
-                include_agent_instruction=False,
+                messages,
             )
             if delta_prompt.strip():
                 return delta_prompt, full_prompt, images, session["upstream_state"], True
@@ -262,6 +263,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             fallback_prompt,
             model_name=model_name,
             allow_webapi=bool(CONFIG.get("agent_use_webapi", False)),
+            agent_mode=True,
+            rebuild_webapi_on_failure=bool(
+                CONFIG.get("agent_webapi_rebuild_on_failure", True)
+            ),
             request_timeout_sec=CONFIG.get("agent_request_timeout_sec", 75),
             retry_attempts=CONFIG.get("agent_retry_attempts", 1),
         )
@@ -761,23 +766,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_choice = req.get("tool_choice", "auto")
         fallback_prompt, images = messages_to_prompt(messages, tools, tool_choice)
-        upstream_state = (
-            _response_store().get_upstream_session(previous_response_id, model_name)
-            if CONFIG.get("reuse_upstream_sessions", False)
-            else {}
-        )
-        if upstream_state:
+        agent_enabled = bool(tools) and tool_choice != "none"
+        if agent_enabled:
+            prompt, fallback_prompt, images, upstream_state, _ = self._prepare_agent_turn(
+                messages, tools, tool_choice, model_name
+            )
+        else:
+            upstream_state = (
+                _response_store().get_upstream_session(previous_response_id, model_name)
+                if CONFIG.get("reuse_upstream_sessions", False)
+                else {}
+            )
+        if not agent_enabled and upstream_state:
             prompt, _ = messages_to_prompt(
                 current_messages,
                 None,
                 "none",
                 include_agent_instruction=False,
             )
-        elif tools and tool_choice != "none":
-            prompt, fallback_prompt, images, upstream_state, _ = self._prepare_agent_turn(
-                messages, tools, tool_choice, model_name
-            )
-        else:
+        elif not agent_enabled:
             prompt = fallback_prompt
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)

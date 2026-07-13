@@ -17,9 +17,14 @@ import gemini_web2api.gemini as gemini
 from gemini_web2api.gemini import extract_response_text
 import gemini_web2api.server as server
 import gemini_web2api.webapi_backend as webapi_backend
-from gemini_web2api.agent import ResponseStore, filter_tool_calls
+from gemini_web2api.agent import ResponseStore, filter_tool_calls, sanitize_model_text
 from gemini_web2api.config import CONFIG
-from gemini_web2api.tools import messages_to_prompt, parse_tool_calls, strip_tool_call_protocol
+from gemini_web2api.tools import (
+    agent_delta_to_prompt,
+    messages_to_prompt,
+    parse_tool_calls,
+    strip_tool_call_protocol,
+)
 from gemini_web2api.webapi_backend import metadata_to_state, state_to_metadata
 
 
@@ -261,6 +266,43 @@ class AgentCompatTests(unittest.TestCase):
         self.assertIn("# Tool Use", prompt)
         self.assertIn('"name":"shell_command"', prompt)
         self.assertIn("continue after each result until done", prompt)
+
+    def test_agent_web_delta_replays_only_normalized_tool_event(self):
+        messages = [
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_one",
+                    "type": "function",
+                    "function": {"name": "shell_command", "arguments": '{"command":"pwd"}'},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_one",
+                "name": "shell_command",
+                "content": "/workspace",
+            },
+        ]
+        prompt = agent_delta_to_prompt([messages[-1]], messages)
+        self.assertIn('"call_id":"call_one"', prompt)
+        self.assertIn('"tool":"shell_command"', prompt)
+        self.assertIn('"command":"pwd"', prompt)
+        self.assertIn("/workspace", prompt)
+        self.assertIn("Continue from the original task", prompt)
+        self.assertNotIn("Agent mode", prompt)
+        self.assertNotIn("Available tools", prompt)
+        self.assertNotIn("run pwd", prompt)
+
+    def test_sanitize_model_text_removes_external_tool_event_echo(self):
+        text = (
+            '[External tool execution result]\n{"call_id":"call_one"}\n'
+            'output:\nsecret output\n[/External tool execution result]\n\n'
+            "Task completed successfully."
+        )
+        self.assertEqual(sanitize_model_text(text), "Task completed successfully.")
 
     def test_unknown_tool_calls_are_removed(self):
         calls = [{
@@ -600,18 +642,20 @@ class AgentCompatTests(unittest.TestCase):
         webapi_generate.assert_not_called()
         self.assertEqual(direct_request.call_args.args[0], "tool result")
 
-    def test_agent_turn_disables_webapi_by_default(self):
+    def test_agent_turn_honors_webapi_and_recovery_settings(self):
         handler = object.__new__(server.GeminiHandler)
         previous = {
             key: CONFIG.get(key)
             for key in (
                 "agent_use_webapi",
+                "agent_webapi_rebuild_on_failure",
                 "agent_request_timeout_sec",
                 "agent_retry_attempts",
             )
         }
         CONFIG.update({
             "agent_use_webapi": False,
+            "agent_webapi_rebuild_on_failure": True,
             "agent_request_timeout_sec": 37,
             "agent_retry_attempts": 1,
         })
@@ -636,8 +680,105 @@ class AgentCompatTests(unittest.TestCase):
             CONFIG.update(previous)
         self.assertEqual((text, state, usage), ("tool call", {}, "prompt"))
         self.assertFalse(generate.call_args.kwargs["allow_webapi"])
+        self.assertTrue(generate.call_args.kwargs["agent_mode"])
+        self.assertTrue(generate.call_args.kwargs["rebuild_webapi_on_failure"])
         self.assertEqual(generate.call_args.kwargs["request_timeout_sec"], 37)
         self.assertEqual(generate.call_args.kwargs["retry_attempts"], 1)
+
+    def test_generate_with_state_marks_agent_web_session(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "reuse_upstream_sessions",
+                "reuse_upstream_agent_sessions",
+                "upstream_session_backend",
+            )
+        }
+        CONFIG.update({
+            "reuse_upstream_sessions": True,
+            "reuse_upstream_agent_sessions": True,
+            "upstream_session_backend": "gemini_webapi",
+        })
+        state = metadata_to_state(
+            ["c1", "r1", "rc1", None, None, None, None, None, None, "ctx"]
+        )
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                return_value=("tool call", state),
+            ) as webapi_generate:
+                text, returned_state, usage_prompt = gemini.generate_with_state(
+                    "full agent prompt",
+                    1,
+                    0,
+                    model_name="gemini-3.5-flash",
+                    agent_mode=True,
+                    request_timeout_sec=17,
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "tool call")
+        self.assertEqual(usage_prompt, "full agent prompt")
+        self.assertEqual(returned_state["backend"], "gemini_webapi_agent")
+        webapi_generate.assert_called_once_with(
+            "full agent prompt",
+            "gemini-3.5-flash",
+            None,
+            temporary=False,
+            timeout_sec=17,
+        )
+
+    def test_agent_web_resume_failure_rebuilds_fresh_web_session(self):
+        previous = {
+            key: CONFIG.get(key)
+            for key in (
+                "reuse_upstream_sessions",
+                "reuse_upstream_agent_sessions",
+                "upstream_session_backend",
+                "upstream_session_fallback_direct",
+            )
+        }
+        CONFIG.update({
+            "reuse_upstream_sessions": True,
+            "reuse_upstream_agent_sessions": True,
+            "upstream_session_backend": "gemini_webapi",
+            "upstream_session_fallback_direct": True,
+        })
+        old_state = metadata_to_state(
+            ["old-c", "old-r", "old-rc", None, None, None, None, None, None, "ctx"]
+        )
+        old_state["backend"] = "gemini_webapi_agent"
+        rebuilt_state = metadata_to_state(
+            ["new-c", "new-r", "new-rc", None, None, None, None, None, None, "new"]
+        )
+        try:
+            with patch(
+                "gemini_web2api.webapi_backend.generate_with_state",
+                side_effect=[RuntimeError("resume stalled"), ("continued", rebuilt_state)],
+            ) as webapi_generate, patch.object(gemini, "_request_text") as direct_request:
+                text, returned_state, usage_prompt = gemini.generate_with_state(
+                    "tool result delta",
+                    1,
+                    0,
+                    conversation=old_state,
+                    fallback_prompt="full compacted agent history",
+                    model_name="gemini-3.5-flash",
+                    agent_mode=True,
+                    rebuild_webapi_on_failure=True,
+                    request_timeout_sec=23,
+                )
+        finally:
+            CONFIG.update(previous)
+        self.assertEqual(text, "continued")
+        self.assertEqual(usage_prompt, "full compacted agent history")
+        self.assertEqual(returned_state["backend"], "gemini_webapi_agent")
+        self.assertEqual(returned_state["conversation_id"], "new-c")
+        self.assertEqual(webapi_generate.call_count, 2)
+        self.assertEqual(webapi_generate.call_args_list[0].args[0], "tool result delta")
+        self.assertEqual(webapi_generate.call_args_list[0].args[2], old_state)
+        self.assertEqual(webapi_generate.call_args_list[1].args[0], "full compacted agent history")
+        self.assertIsNone(webapi_generate.call_args_list[1].args[2])
+        direct_request.assert_not_called()
 
     def test_generate_with_state_honors_agent_timeout_and_retry_overrides(self):
         previous = CONFIG.get("retry_attempts")
@@ -1407,7 +1548,10 @@ class AgentCompatTests(unittest.TestCase):
                 })
                 self.assertEqual(second["choices"][0]["finish_reason"], "stop")
                 self.assertEqual(len(harness.prompts), 2)
-                self.assertEqual(harness.prompts[1], "[Tool result for shell_command]: /workspace")
+                self.assertIn("[External tool execution result]", harness.prompts[1])
+                self.assertIn('"tool":"shell_command"', harness.prompts[1])
+                self.assertIn('"command":"pwd"', harness.prompts[1])
+                self.assertIn("/workspace", harness.prompts[1])
                 self.assertNotIn("Agent mode", harness.prompts[1])
                 self.assertNotIn("Available tools", harness.prompts[1])
             finally:
@@ -1672,7 +1816,7 @@ class AgentCompatTests(unittest.TestCase):
             harness = HttpHarness(tmpdir, [
                 '{"name":"shell_command","arguments":{"command":"New-Item -ItemType File -Force -Path test.txt"}}',
                 '{"name":"shell_command","arguments":{"command":"Get-Content test.txt"}}',
-            ])
+            ], reuse_upstream_agent_sessions=True)
             try:
                 first = harness.post("/v1/responses", {
                     "model": "gemini-3.5-flash",
@@ -1698,7 +1842,8 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertEqual(second["previous_response_id"], first["id"])
                 self.assertEqual(second["output"][0]["type"], "function_call")
                 self.assertNotIn("创建 test.txt", harness.prompts[1])
-                self.assertNotIn("New-Item", harness.prompts[1])
+                self.assertIn("New-Item", harness.prompts[1])
+                self.assertIn('"tool":"shell_command"', harness.prompts[1])
                 self.assertNotIn("Agent mode", harness.prompts[1])
                 self.assertNotIn("Available tools", harness.prompts[1])
                 self.assertIn("truncated", harness.prompts[1])

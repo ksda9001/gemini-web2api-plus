@@ -227,8 +227,9 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "reuse_upstream_sessions": false,
   "upstream_session_backend": "gemini_webapi",
   "upstream_session_fallback_direct": true,
-  "reuse_upstream_agent_sessions": false,
-  "agent_use_webapi": false,
+  "reuse_upstream_agent_sessions": true,
+  "agent_use_webapi": true,
+  "agent_webapi_rebuild_on_failure": true,
   "agent_request_timeout_sec": 75,
   "agent_retry_attempts": 1,
   "cookie_cache_path": "/app/data/gemini_cookies",
@@ -253,12 +254,13 @@ Agent 相关配置:
 - `google_stream_auto_tools`: 保持 `false` 可优先保证 Open WebUI/NewAPI 这类流式聊天稳定；只有需要 Google 原生流式 AUTO 工具调用时才设为 `true`
 - `continuation_attempts`: Gemini Web 明确返回输出上限标记 (`BardErrorInfo 1155`) 时，自动从断点续写的最大轮数
 - `sse_heartbeat_sec`: 等待 Gemini 首段或 agent 工具决策期间发送 SSE 注释心跳的间隔，避免 NewAPI、Open WebUI 或反向代理把仍在工作的请求当成断连
-- `reuse_upstream_sessions`: 启用 Gemini Web 上游会话复用；保存完整 metadata，适用于普通 Chat Completions、Claude Messages、Codex Responses 和 Google 原生 `/v1beta` 聊天。匿名部署默认保持 `false`；配置同一浏览器会话的 Cookie 后再启用
+- `reuse_upstream_sessions`: 启用 Gemini Web 上游会话复用；保存完整 metadata，适用于普通聊天和 Chat Completions、Claude Messages、Codex Responses、Google 原生 `/v1beta` 的 Agent 工具循环。匿名部署默认保持 `false`；配置同一浏览器会话的 Cookie 后再启用
 - `upstream_session_backend`: `gemini_webapi` 使用动态网页 token/模型 header 和 Cookie 刷新；`direct` 保留旧逆向请求实现
 - `upstream_session_fallback_direct`: 新后端初始化或续接失败时，自动用完整历史回退到 direct 后端
-- `reuse_upstream_agent_sessions`: 默认保持 `false`。普通聊天可安全复用 Gemini Web metadata；Agent 的工具结果轮会带完整压缩工具历史走 direct 后端，因为 Gemini Web 对合成工具协议的会话续接可能停滞
-- `agent_use_webapi`: 默认保持 `false`。Agent 工具决策使用 direct 后端；对于合成 tool-call 协议，它比 Gemini Web 的聊天会话渲染器更可靠
-- `agent_request_timeout_sec` / `agent_retry_attempts`: 仅用于 Agent direct 后端的单轮限制。默认值（`75` 秒、`1` 次）避免 Gemini 卡住时等待数分钟；到期会返回保守且已声明的工具调用继续循环。普通聊天继续使用 `request_timeout_sec` 和 `retry_attempts`
+- `reuse_upstream_agent_sessions`: 在 SQLite 中保存 Agent `call_id` 到 Gemini Web metadata 的映射。完整 Agent 行为提示和工具定义只在创建网页会话时发送；后续只发送规范化的新增工具事件和用户追问
+- `agent_use_webapi`: 以登录后的 Gemini 网页会话作为 Agent 主后端。工具仍由 Codex、Claude Code 或 Copilot 执行，结果会作为增量外部工具事件续接到同一个 Gemini 对话
+- `agent_webapi_rebuild_on_failure`: 已保存的 Gemini CID 无法续接时，先把压缩后的完整 Agent 历史发送到一个新网页会话并替换 SQLite 映射，再考虑回退 direct 后端
+- `agent_request_timeout_sec` / `agent_retry_attempts`: 仅用于 Agent 的网页和 direct 单轮限制。默认值（`75` 秒、`1` 次）避免卡住时等待数分钟；普通聊天继续使用自己的超时和重试设置
 - `cookie_cache_path`: 自动轮换后的 Google Cookie 私有缓存目录；必须放在持久化 volume 中，不能提交 Git
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: 后台轮换 `__Secure-1PSIDTS` 并保存，避免长期运行后认证过期
 - `webapi_watchdog_sec`: Gemini 流长时间无数据时判定停滞并恢复的阈值
