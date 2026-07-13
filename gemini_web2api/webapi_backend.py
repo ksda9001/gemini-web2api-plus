@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 
 from .config import CONFIG
+from .cookies import load_cookie_pairs
 
 try:
     from gemini_webapi import GeminiClient
@@ -43,26 +44,7 @@ def _request_timeout() -> int:
 
 def _cookie_pairs() -> dict:
     path = CONFIG.get("cookie_file")
-    if not path or not os.path.exists(path):
-        return {}
-    with open(path, "r") as f:
-        content = f.read().strip()
-    if not content:
-        return {}
-    if content.startswith("{"):
-        data = json.loads(content)
-        if isinstance(data, dict) and isinstance(data.get("cookie"), str):
-            content = data["cookie"]
-        elif isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
-    pairs = {}
-    for part in content.split(";"):
-        if "=" not in part:
-            continue
-        name, value = part.strip().split("=", 1)
-        if name:
-            pairs[name] = value
-    return pairs
+    return load_cookie_pairs(path)[0]
 
 
 def state_to_metadata(state: dict = None) -> list:
@@ -161,6 +143,18 @@ class GeminiWebAPIBackend:
         return pairs, secure_1psid, secure_1psidts, fingerprint
 
     @staticmethod
+    def _source_cookie_fingerprint() -> str:
+        """Fingerprint the mounted file separately from expiring active pairs."""
+        path = CONFIG.get("cookie_file")
+        if not path:
+            return ""
+        try:
+            with open(path, "rb") as file:
+                return hashlib.sha256(file.read()).hexdigest()
+        except OSError:
+            return ""
+
+    @staticmethod
     async def _close_client(client):
         """Best-effort cleanup for a partially initialized external client."""
         if client is None:
@@ -172,6 +166,32 @@ class GeminiWebAPIBackend:
             # interrupted. It is already being discarded, so do not let its
             # cleanup exception prevent a fresh authenticated client.
             pass
+
+    @staticmethod
+    def _prepare_cookie_cache(cache_path: str, fingerprint: str):
+        """Discard derived cookies only when the mounted browser Cookie changes."""
+        if not cache_path:
+            return
+        try:
+            os.makedirs(cache_path, exist_ok=True)
+            marker = os.path.join(cache_path, ".gemini-web2api-source-cookie-fingerprint")
+            try:
+                with open(marker, "r") as file:
+                    previous = file.read().strip()
+            except OSError:
+                previous = ""
+            if previous == fingerprint:
+                return
+            for name in os.listdir(cache_path):
+                candidate = os.path.join(cache_path, name)
+                if name.startswith(".cached_cookies_") and os.path.isfile(candidate):
+                    os.remove(candidate)
+            with open(marker, "w") as file:
+                file.write(fingerprint)
+        except OSError:
+            # Cookie caching is an optimization; authentication must still work
+            # when the configured cache directory is read-only or unavailable.
+            return
 
     async def _ensure_client(self):
         async with self._client_lock:
@@ -195,6 +215,13 @@ class GeminiWebAPIBackend:
 
             cache_path = CONFIG.get("cookie_cache_path")
             if cache_path:
+                # A short-lived RTS cookie naturally disappearing from the
+                # active set should reinitialize the client, but must not erase
+                # newer cookies saved by gemini-webapi. Clear derived cache only
+                # when the mounted source file itself was replaced.
+                self._prepare_cookie_cache(
+                    str(cache_path), self._source_cookie_fingerprint() or fingerprint
+                )
                 os.environ["GEMINI_COOKIE_PATH"] = str(cache_path)
             client = GeminiClient(
                 secure_1psid,

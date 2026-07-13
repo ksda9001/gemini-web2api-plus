@@ -16,9 +16,10 @@ except ImportError:
     HAS_HTTPX = False
 
 from .config import CONFIG
+from .cookies import cookie_header, load_cookie_pairs
 
 _ssl_ctx = None
-_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_cache = {"str": "", "sapisid": None, "mtime": 0, "expires_at": None}
 _httpx_client = None
 TRUNCATION_ERROR_CODES = {1155}
 
@@ -47,25 +48,29 @@ def _get_httpx_client():
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file with mtime-based caching."""
+    """Load only browser-valid Gemini cookies with expiry-aware caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
+        now = time.time()
         mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+        expires_at = _cookie_cache.get("expires_at")
+        if (
+            mtime == _cookie_cache["mtime"]
+            and _cookie_cache["str"]
+            and (expires_at is None or now < expires_at)
+        ):
             return _cookie_cache["str"], _cookie_cache["sapisid"]
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        pairs, next_expiry = load_cookie_pairs(cookie_file, now)
+        cookie_str = cookie_header(pairs)
+        sapisid = pairs.get("SAPISID", "")
+        _cookie_cache.update({
+            "str": cookie_str,
+            "sapisid": sapisid or None,
+            "mtime": mtime,
+            "expires_at": next_expiry,
+        })
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")

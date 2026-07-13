@@ -19,6 +19,7 @@ import gemini_web2api.server as server
 import gemini_web2api.webapi_backend as webapi_backend
 from gemini_web2api.agent import ResponseStore, filter_tool_calls, sanitize_model_text
 from gemini_web2api.config import CONFIG
+from gemini_web2api.cookies import cookie_pairs_from_content
 from gemini_web2api.tools import (
     agent_delta_to_prompt,
     messages_to_prompt,
@@ -555,6 +556,76 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertNotEqual(first_fingerprint, second_fingerprint)
             finally:
                 CONFIG["cookie_file"] = previous
+
+    def test_browser_cookie_export_omits_expired_and_non_gemini_cookies(self):
+        exported = json.dumps([
+            {"name": "SID", "value": "live", "domain": ".google.com", "expirationDate": 2000},
+            {"name": "COMPASS", "value": "session", "domain": ".gemini.google.com"},
+            {"name": "__Secure-1PSIDRTS", "value": "expired", "domain": ".google.com", "expirationDate": 999},
+            {"name": "OTHER", "value": "ignore", "domain": ".example.com", "expirationDate": 3000},
+            {"name": "ACCOUNT", "value": "ignore", "domain": "accounts.google.com", "hostOnly": True},
+        ])
+        pairs, next_expiry = cookie_pairs_from_content(exported, now=1000)
+        self.assertEqual(pairs, {"SID": "live", "COMPASS": "session"})
+        self.assertEqual(next_expiry, 2000)
+
+    def test_direct_cookie_cache_rechecks_browser_export_at_expiry(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cookie_path = Path(tmpdir) / "cookie.json"
+            cookie_path.write_text(json.dumps([
+                {"name": "SAPISID", "value": "live", "domain": ".google.com", "expirationDate": 3000},
+                {"name": "__Secure-1PSIDRTS", "value": "short", "domain": ".google.com", "expirationDate": 1500},
+            ]), encoding="utf-8")
+            previous_path = CONFIG.get("cookie_file")
+            previous_cache = dict(gemini._cookie_cache)
+            CONFIG["cookie_file"] = str(cookie_path)
+            gemini._cookie_cache = {"str": "", "sapisid": None, "mtime": 0, "expires_at": None}
+            try:
+                with patch.object(gemini.time, "time", side_effect=[1000, 1501]):
+                    first, _ = gemini.load_cookie()
+                    second, _ = gemini.load_cookie()
+            finally:
+                CONFIG["cookie_file"] = previous_path
+                gemini._cookie_cache = previous_cache
+        self.assertIn("__Secure-1PSIDRTS=short", first)
+        self.assertNotIn("__Secure-1PSIDRTS=short", second)
+        self.assertIn("SAPISID=live", second)
+
+    def test_webapi_cache_resets_when_mounted_cookie_changes(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cache_path = Path(tmpdir) / "cookies"
+            cache_path.mkdir()
+            cached = cache_path / ".cached_cookies_old.json"
+            cached.write_text("old", encoding="utf-8")
+            webapi_backend.GeminiWebAPIBackend._prepare_cookie_cache(str(cache_path), "first")
+            self.assertFalse(cached.exists())
+            fresh = cache_path / ".cached_cookies_fresh.json"
+            fresh.write_text("fresh", encoding="utf-8")
+            webapi_backend.GeminiWebAPIBackend._prepare_cookie_cache(str(cache_path), "first")
+            self.assertTrue(fresh.exists())
+            webapi_backend.GeminiWebAPIBackend._prepare_cookie_cache(str(cache_path), "second")
+            self.assertFalse(fresh.exists())
+
+    def test_webapi_source_fingerprint_ignores_active_cookie_expiry(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cookie_path = Path(tmpdir) / "cookie.json"
+            cookie_path.write_text(json.dumps([
+                {"name": "__Secure-1PSID", "value": "login", "domain": ".google.com", "expirationDate": 3000},
+                {"name": "__Secure-1PSIDRTS", "value": "short", "domain": ".google.com", "expirationDate": 1500},
+            ]), encoding="utf-8")
+            previous = CONFIG.get("cookie_file")
+            CONFIG["cookie_file"] = str(cookie_path)
+            try:
+                source_before = webapi_backend.GeminiWebAPIBackend._source_cookie_fingerprint()
+                with patch("gemini_web2api.cookies.time.time", return_value=1000):
+                    active_before = webapi_backend.GeminiWebAPIBackend._credentials()[3]
+                with patch("gemini_web2api.cookies.time.time", return_value=1600):
+                    active_after = webapi_backend.GeminiWebAPIBackend._credentials()[3]
+                source_after = webapi_backend.GeminiWebAPIBackend._source_cookie_fingerprint()
+            finally:
+                CONFIG["cookie_file"] = previous
+        self.assertNotEqual(active_before, active_after)
+        self.assertEqual(source_before, source_after)
 
     def test_webapi_serializes_concurrent_client_initialization(self):
         class Status:

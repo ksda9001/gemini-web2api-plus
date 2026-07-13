@@ -164,12 +164,14 @@ python -m gemini_web2api --cookie-file cookie.txt
 SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值; SAPISID=你的SAPISID值; __Secure-1PSID=你的1PSID值; __Secure-1PSIDTS=你的1PSIDTS值
 ```
 
-或使用 JSON 格式:
+或使用紧凑 JSON 格式:
 ```json
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx; __Secure-1PSIDTS=xxx", "sapisid": "你的SAPISID值"}
 ```
 
-**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
+也可以直接使用完整的 Chrome/Playwright 风格 JSON 导出：既支持 Cookie 对象数组，也支持 `{"url":"https://gemini.google.com","cookies":[...]}`。推荐保留这种格式，因为其中包含每个 Cookie 的域名和过期时间；服务会像浏览器一样自动忽略已过期的 `__Secure-1PSIDRTS` 等短期 Cookie。挂载的 Cookie 文件被替换时，旧的派生刷新缓存会自动清理，但不会删除 SQLite 对话记录。
+
+**替代方案（浏览器扩展）**：使用能保留 Cookie 对象和过期时间的导出扩展。导出文件必须私密挂载为 `cookie_file`，不要提交到 Git。
 
 ### 登录账号路径与 XSRF Token
 
@@ -262,7 +264,7 @@ Agent 相关配置:
 - `agent_use_webapi`: 以登录后的 Gemini 网页会话作为 Agent 主后端。工具仍由 Codex、Claude Code 或 Copilot 执行，结果会作为增量外部工具事件续接到同一个 Gemini 对话
 - `agent_webapi_rebuild_on_failure`: 已保存的 Gemini CID 无法续接时，先把压缩后的完整 Agent 历史发送到一个新网页会话并替换 SQLite 映射，再考虑回退 direct 后端
 - `agent_request_timeout_sec` / `agent_retry_attempts`: 仅用于 Agent 的网页和 direct 单轮限制。默认值（`75` 秒、`1` 次）避免卡住时等待数分钟；普通聊天继续使用自己的超时和重试设置
-- `cookie_cache_path`: 自动轮换后的 Google Cookie 私有缓存目录；必须放在持久化 volume 中，不能提交 Git
+- `cookie_cache_path`: 自动轮换后的 Google Cookie 私有缓存目录；必须放在持久化 volume 中，不能提交 Git。替换挂载的源 Cookie 时会自动清理旧派生缓存，但保留 SQLite 对话记忆
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: 后台轮换 `__Secure-1PSIDTS` 并保存，避免长期运行后认证过期
 - `webapi_watchdog_sec`: Gemini 流长时间无数据时判定停滞并恢复的阈值
 - `webapi_request_timeout_sec`: 新上游非流式请求的总等待上限，以及流式请求相邻输出之间的闲置上限；超时会取消后台任务并按配置回退 direct

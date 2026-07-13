@@ -174,12 +174,14 @@ python -m gemini_web2api --cookie-file cookie.txt
 SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value; __Secure-1PSIDTS=your_1psidts_value
 ```
 
-Or use the JSON format:
+Or use the compact JSON format:
 ```json
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx; __Secure-1PSIDTS=xxx", "sapisid": "your_sapisid_value"}
 ```
 
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
+Complete Chrome/Playwright-style JSON exports are also accepted directly, either as a cookie-object array or as `{"url":"https://gemini.google.com","cookies":[...]}`. This is the preferred format because it retains each cookie's domain and expiration time. Expired short-lived cookies such as `__Secure-1PSIDRTS` are then omitted automatically, matching browser behavior. When the mounted Cookie file is replaced, stale derived refresh-cache files are cleared without deleting SQLite conversations.
+
+**Alternative (browser extension)**: Use an "Export Cookies" extension that preserves cookie objects and expiration dates. Keep the export private and mount it as `cookie_file`; never commit it to Git.
 
 ### Authenticated account path and XSRF token
 
@@ -272,7 +274,7 @@ Agent-related config:
 - `agent_use_webapi`: use the authenticated Gemini Web conversation as the primary Agent backend. Tool calls still execute in Codex, Claude Code, or Copilot; their results are encoded as incremental external-tool events in the same Gemini conversation
 - `agent_webapi_rebuild_on_failure`: if a saved Gemini CID cannot resume, replay the compacted full Agent history into one fresh Gemini Web conversation and replace the SQLite mapping before falling back to the direct backend
 - `agent_request_timeout_sec` / `agent_retry_attempts`: limits used only by Agent turns for both Web and direct requests. The defaults (`75` seconds, `1` attempt) avoid spending several minutes on a stalled request before recovery; ordinary chat retains its own timeout and retry settings
-- `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it
+- `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it. Replacing the mounted source Cookie automatically clears stale derived cache while preserving SQLite conversation memory
 - `cookie_auto_refresh` / `cookie_refresh_interval_sec`: rotate and persist `__Secure-1PSIDTS` in the background
 - `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
 - `webapi_request_timeout_sec`: total wait for non-stream requests and idle wait between streaming deltas; expiration cancels the background task and allows the configured direct fallback
