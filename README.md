@@ -1,8 +1,4 @@
-# gemini-web2api
-
-<p align="center">
-  <img src="logo.png" width="160" alt="gemini-web2api logo">
-</p>
+# gemini-web2api-plus
 
 <p align="center">
   <strong>Turn Gemini Web into an Agent backend for Codex, Claude Code, and Copilot.</strong><br>
