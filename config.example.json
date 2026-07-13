@@ -39,5 +39,6 @@
   "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1,
   "temporary_background_tasks": true,
-  "require_authenticated_webapi": true
+  "require_authenticated_webapi": true,
+  "webapi_allow_unverified_account": false
 }

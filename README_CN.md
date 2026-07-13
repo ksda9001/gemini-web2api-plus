@@ -239,7 +239,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1,
   "temporary_background_tasks": true,
-  "require_authenticated_webapi": true
+  "require_authenticated_webapi": true,
+  "webapi_allow_unverified_account": false
 }
 ```
 
@@ -268,8 +269,9 @@ Agent 相关配置:
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 - `temporary_background_tasks`: 识别 Open WebUI 默认的标题、标签、后续问题和图片提示词后台请求，并使用 Gemini 临时聊天发送；这些辅助请求仍会正常返回结果，但不会出现在 Gemini 网页历史中，只有真实对话会保留
 - `require_authenticated_webapi`: 使用持久化上游会话前要求 Gemini 账号状态为 `AVAILABLE`；Cookie 过期时会明确记录并走已配置的 direct 回退，不再静默创建无法出现在账号历史中的匿名会话
+- `webapi_allow_unverified_account`: 默认保持 `false`。仅当挂载的 Cookie 已通过真实 Gemini 网页探针，能创建可见对话并获得回复，但外部 `gemini-webapi` 库仍误报 `UNAUTHENTICATED` 时才设为 `true`；它只放行这个已知状态误报，不会关闭 Cookie 校验
 
-Agent 网页续接采用增量方式：首轮只发送一次行为提示、工具定义和任务，并在工具调用后把 Gemini 会话 metadata 按客户端 `call_id` 保存到 SQLite。后续轮恢复同一个 CID，只发送规范化后的新增工具调用/结果事件和新增用户文本。如果外部 `gemini-webapi` 适配器拒绝当前账号会话，兜底仍请求 Gemini Web 的 `StreamGenerate` 端点；只要 Google 返回可用 metadata，就继续复用 CID。
+Agent 网页续接采用增量方式：首轮只发送一次行为提示、工具定义和任务，并在工具调用后把 Gemini 会话 metadata 按客户端 `call_id` 保存到 SQLite。后续轮恢复同一个 CID，只发送规范化后的新增工具调用/结果事件和新增用户文本。工具事件旁由客户端附带的单独 `.` 会被视为占位符，不会发给 Gemini。如果外部 `gemini-webapi` 适配器拒绝当前账号会话，兜底仍请求 Gemini Web 的 `StreamGenerate` 端点；只要 Google 返回可用 metadata，就继续复用 CID。
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
 

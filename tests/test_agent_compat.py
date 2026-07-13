@@ -296,6 +296,20 @@ class AgentCompatTests(unittest.TestCase):
         self.assertNotIn("Available tools", prompt)
         self.assertNotIn("run pwd", prompt)
 
+    def test_agent_web_delta_drops_dot_placeholder_beside_tool_event(self):
+        messages = [
+            {"role": "user", "content": "."},
+            {
+                "role": "tool",
+                "tool_call_id": "call_one",
+                "name": "shell_command",
+                "content": "/workspace",
+            },
+        ]
+        prompt = agent_delta_to_prompt(messages, messages)
+        self.assertNotIn("\n\n.\n\n", prompt)
+        self.assertIn("/workspace", prompt)
+
     def test_sanitize_model_text_removes_external_tool_event_echo(self):
         text = (
             '[External tool execution result]\n{"call_id":"call_one"}\n'
@@ -436,15 +450,21 @@ class AgentCompatTests(unittest.TestCase):
         class FakeClient:
             account_status = Status()
 
-        previous = CONFIG.get("require_authenticated_webapi")
+        previous = {
+            key: CONFIG.get(key)
+            for key in ("require_authenticated_webapi", "webapi_allow_unverified_account")
+        }
         try:
             CONFIG["require_authenticated_webapi"] = True
+            CONFIG["webapi_allow_unverified_account"] = False
             with self.assertRaisesRegex(RuntimeError, "not authenticated"):
                 webapi_backend._assert_authenticated(FakeClient())
+            CONFIG["webapi_allow_unverified_account"] = True
+            webapi_backend._assert_authenticated(FakeClient())
             CONFIG["require_authenticated_webapi"] = False
             webapi_backend._assert_authenticated(FakeClient())
         finally:
-            CONFIG["require_authenticated_webapi"] = previous
+            CONFIG.update(previous)
 
     def test_webapi_accepts_available_account(self):
         class Status:
@@ -532,6 +552,64 @@ class AgentCompatTests(unittest.TestCase):
                 self.assertNotEqual(first_fingerprint, second_fingerprint)
             finally:
                 CONFIG["cookie_file"] = previous
+
+    def test_webapi_serializes_concurrent_client_initialization(self):
+        class Status:
+            name = "AVAILABLE"
+
+        class BrokenClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+                raise AttributeError("HTTP session was never created")
+
+        class FakeClient:
+            instances = []
+            init_calls = 0
+
+            def __init__(self, *args, **kwargs):
+                self._running = False
+                self.account_status = Status()
+                self.cookies = {}
+                FakeClient.instances.append(self)
+
+            async def init(self, **kwargs):
+                FakeClient.init_calls += 1
+                await asyncio.sleep(0.01)
+                self._running = True
+
+            async def close(self):
+                self._running = False
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cookie_path = Path(tmpdir) / "cookie.txt"
+            cookie_path.write_text("__Secure-1PSID=one; SID=sid-one", encoding="utf-8")
+            previous_cookie_file = CONFIG.get("cookie_file")
+            previous_client = webapi_backend.GeminiClient
+            backend = object.__new__(webapi_backend.GeminiWebAPIBackend)
+            broken = BrokenClient()
+            backend._client = broken
+            backend._cookie_fingerprint = "stale"
+            backend._client_lock = asyncio.Lock()
+            CONFIG["cookie_file"] = str(cookie_path)
+            webapi_backend.GeminiClient = FakeClient
+            try:
+                async def initialize_twice():
+                    return await asyncio.gather(
+                        backend._ensure_client(), backend._ensure_client()
+                    )
+
+                first, second = asyncio.run(initialize_twice())
+            finally:
+                CONFIG["cookie_file"] = previous_cookie_file
+                webapi_backend.GeminiClient = previous_client
+
+        self.assertIs(first, second)
+        self.assertEqual(FakeClient.init_calls, 1)
+        self.assertEqual(len(FakeClient.instances), 1)
+        self.assertEqual(broken.close_calls, 1)
 
     def test_webapi_non_stream_timeout_cancels_background_future(self):
         class TimedOutFuture:

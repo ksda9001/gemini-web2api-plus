@@ -249,7 +249,8 @@ Create `config.json` in the same directory:
   "webapi_request_timeout_sec": 180,
   "tool_retry_attempts": 1,
   "temporary_background_tasks": true,
-  "require_authenticated_webapi": true
+  "require_authenticated_webapi": true,
+  "webapi_allow_unverified_account": false
 }
 ```
 
@@ -278,8 +279,9 @@ Agent-related config:
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 - `temporary_background_tasks`: recognize Open WebUI's default title, tags, follow-up, and image-prompt helper requests and send them as Gemini temporary chats, so only the real conversation appears in Gemini Web history
 - `require_authenticated_webapi`: require Gemini account status `AVAILABLE` before using persistent upstream sessions; expired cookies are reported and routed through the configured direct fallback instead of silently creating anonymous conversations
+- `webapi_allow_unverified_account`: keep `false` by default. Set it to `true` only after a real Gemini Web probe with the mounted Cookie can create a visible conversation and receive a response, but the external `gemini-webapi` library still misreports `UNAUTHENTICATED`; it permits that known library-status false positive without disabling Cookie checks
 
-Agent Web continuation is incremental: the initial turn sends the behavior instruction, tool schema, and task once. A successful tool call saves its Gemini conversation metadata under the client call ID in SQLite. Later turns resume that CID with only the new normalized tool call/result event and any new user text. If the external `gemini-webapi` adapter rejects the account session, the fallback still targets Gemini Web's `StreamGenerate` endpoint and preserves CID continuation when Google returns usable metadata.
+Agent Web continuation is incremental: the initial turn sends the behavior instruction, tool schema, and task once. A successful tool call saves its Gemini conversation metadata under the client call ID in SQLite. Later turns resume that CID with only the new normalized tool call/result event and any new user text. A lone `.` supplied alongside a tool event is treated as a client placeholder and is not sent to Gemini. If the external `gemini-webapi` adapter rejects the account session, the fallback still targets Gemini Web's `StreamGenerate` endpoint and preserves CID continuation when Google returns usable metadata.
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 

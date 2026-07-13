@@ -216,7 +216,11 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
     """Encode only new external tool events for a resumed Gemini Web chat."""
     call_index = _agent_tool_call_index(all_messages or delta_messages)
     parts = []
-    has_tool_event = False
+    has_tool_event = any(
+        isinstance(message, dict)
+        and (message.get("role") == "tool" or message.get("tool_calls"))
+        for message in (delta_messages or [])
+    )
 
     for message in delta_messages or []:
         if not isinstance(message, dict):
@@ -224,7 +228,6 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
         role = message.get("role", "user")
         tool_calls = message.get("tool_calls") or []
         if tool_calls:
-            has_tool_event = True
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
@@ -242,7 +245,6 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
                 )
 
         if role == "tool":
-            has_tool_event = True
             call_id = message.get("tool_call_id", "")
             known_call = call_index.get(call_id, {})
             message_name = message.get("name", "")
@@ -264,6 +266,13 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
                 + "\n[/External tool execution result]"
             )
         elif not tool_calls:
+            if (
+                has_tool_event
+                and role in ("user", "assistant")
+                and isinstance(message.get("content"), str)
+                and message["content"].strip() == "."
+            ):
+                continue
             generic, _ = messages_to_prompt(
                 [message], None, "none", include_agent_instruction=False
             )

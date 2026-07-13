@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "tool_retry_attempts": 1,
     "temporary_background_tasks": True,
     "require_authenticated_webapi": True,
+    "webapi_allow_unverified_account": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

@@ -118,6 +118,8 @@ def _assert_authenticated(client):
     if not CONFIG.get("require_authenticated_webapi", True):
         return
     status = _account_status_name(client)
+    if status != "AVAILABLE" and CONFIG.get("webapi_allow_unverified_account", False):
+        return
     if status != "AVAILABLE":
         raise RuntimeError(
             "Gemini Web account is not authenticated "
@@ -132,10 +134,14 @@ class GeminiWebAPIBackend:
         if GeminiClient is None:
             raise RuntimeError("gemini-webapi is not installed")
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
         self._client = None
         self._cookie_fingerprint = ""
+        # Open WebUI commonly sends a user turn and background title/tag turns
+        # together. Keep those coroutines from replacing a client while its
+        # initial authentication request is still in flight.
+        self._client_lock = asyncio.Lock()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -154,50 +160,74 @@ class GeminiWebAPIBackend:
         ).hexdigest()
         return pairs, secure_1psid, secure_1psidts, fingerprint
 
-    async def _ensure_client(self):
-        pairs, secure_1psid, secure_1psidts, fingerprint = self._credentials()
-        if not secure_1psid:
-            raise RuntimeError("cookie file does not contain __Secure-1PSID")
-        if (
-            self._client is not None
-            and getattr(self._client, "_running", False)
-            and fingerprint == self._cookie_fingerprint
-        ):
-            _assert_authenticated(self._client)
-            return self._client
-
-        if self._client is not None:
-            await self._client.close()
-
-        cache_path = CONFIG.get("cookie_cache_path")
-        if cache_path:
-            os.environ["GEMINI_COOKIE_PATH"] = str(cache_path)
-        self._client = GeminiClient(
-            secure_1psid,
-            secure_1psidts or None,
-            proxy=CONFIG.get("proxy"),
-        )
-        # Preserve the complete browser session. Some accounts can authenticate
-        # with 1PSID alone, while others still require companion Google cookies.
-        self._client.cookies = pairs
-        timeout = int(CONFIG.get("request_timeout_sec", 180) or 180)
-        await self._client.init(
-            timeout=timeout,
-            auto_close=False,
-            auto_refresh=bool(CONFIG.get("cookie_auto_refresh", True)),
-            refresh_interval=max(60, int(CONFIG.get("cookie_refresh_interval_sec", 600) or 600)),
-            watchdog_timeout=min(timeout, int(CONFIG.get("webapi_watchdog_sec", 120) or 120)),
-            verbose=bool(CONFIG.get("log_requests", False)),
-        )
+    @staticmethod
+    async def _close_client(client):
+        """Best-effort cleanup for a partially initialized external client."""
+        if client is None:
+            return
         try:
-            _assert_authenticated(self._client)
+            await client.close()
         except Exception:
-            await self._client.close()
+            # gemini-webapi can leave its HTTP session unset when init was
+            # interrupted. It is already being discarded, so do not let its
+            # cleanup exception prevent a fresh authenticated client.
+            pass
+
+    async def _ensure_client(self):
+        async with self._client_lock:
+            # Re-read after acquiring the lock so a mounted Cookie replacement
+            # is always evaluated by exactly one initializer.
+            pairs, secure_1psid, secure_1psidts, fingerprint = self._credentials()
+            if not secure_1psid:
+                raise RuntimeError("cookie file does not contain __Secure-1PSID")
+            if (
+                self._client is not None
+                and getattr(self._client, "_running", False)
+                and fingerprint == self._cookie_fingerprint
+            ):
+                _assert_authenticated(self._client)
+                return self._client
+
+            old_client = self._client
             self._client = None
             self._cookie_fingerprint = ""
-            raise
-        self._cookie_fingerprint = fingerprint
-        return self._client
+            await self._close_client(old_client)
+
+            cache_path = CONFIG.get("cookie_cache_path")
+            if cache_path:
+                os.environ["GEMINI_COOKIE_PATH"] = str(cache_path)
+            client = GeminiClient(
+                secure_1psid,
+                secure_1psidts or None,
+                proxy=CONFIG.get("proxy"),
+            )
+            # Preserve the complete browser session. Some accounts can authenticate
+            # with 1PSID alone, while others still require companion Google cookies.
+            client.cookies = pairs
+            timeout = int(CONFIG.get("request_timeout_sec", 180) or 180)
+            try:
+                await client.init(
+                    timeout=timeout,
+                    auto_close=False,
+                    auto_refresh=bool(CONFIG.get("cookie_auto_refresh", True)),
+                    refresh_interval=max(
+                        60,
+                        int(CONFIG.get("cookie_refresh_interval_sec", 600) or 600),
+                    ),
+                    watchdog_timeout=min(
+                        timeout,
+                        int(CONFIG.get("webapi_watchdog_sec", 120) or 120),
+                    ),
+                    verbose=bool(CONFIG.get("log_requests", False)),
+                )
+                _assert_authenticated(client)
+            except Exception:
+                await self._close_client(client)
+                raise
+
+            self._client = client
+            self._cookie_fingerprint = fingerprint
+            return client
 
     @staticmethod
     def _model(client, requested_name: str):
