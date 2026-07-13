@@ -265,7 +265,7 @@ Agent-related config:
 - `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
 - `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
 - `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for plain chats and Agent tool loops across Chat Completions, Claude Messages, Codex Responses, and Google-native `/v1beta`. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
-- `upstream_session_backend`: `gemini_webapi` uses dynamic page tokens/model headers and cookie refresh; `direct` retains the legacy request builder
+- `upstream_session_backend`: `gemini_webapi` uses the external Gemini Web session library with dynamic page tokens/model headers and cookie refresh; `direct` means this project's legacy direct request to Gemini Web's internal `StreamGenerate` endpoint, not an official or stateless model API. Both backends can carry Gemini Web conversation metadata/CIDs
 - `upstream_session_fallback_direct`: replay full history through the direct backend if the primary backend cannot initialize or resume
 - `reuse_upstream_agent_sessions`: persist the Agent call ID to Gemini Web metadata mapping in SQLite. The full Agent behavior prompt and tool schema are sent when the Web conversation is created; later turns send only normalized new tool events and user follow-ups
 - `agent_use_webapi`: use the authenticated Gemini Web conversation as the primary Agent backend. Tool calls still execute in Codex, Claude Code, or Copilot; their results are encoded as incremental external-tool events in the same Gemini conversation
@@ -278,6 +278,8 @@ Agent-related config:
 - `tool_retry_attempts`: repair retries when the model should call a tool but returns text
 - `temporary_background_tasks`: recognize Open WebUI's default title, tags, follow-up, and image-prompt helper requests and send them as Gemini temporary chats, so only the real conversation appears in Gemini Web history
 - `require_authenticated_webapi`: require Gemini account status `AVAILABLE` before using persistent upstream sessions; expired cookies are reported and routed through the configured direct fallback instead of silently creating anonymous conversations
+
+Agent Web continuation is incremental: the initial turn sends the behavior instruction, tool schema, and task once. A successful tool call saves its Gemini conversation metadata under the client call ID in SQLite. Later turns resume that CID with only the new normalized tool call/result event and any new user text. If the external `gemini-webapi` adapter rejects the account session, the fallback still targets Gemini Web's `StreamGenerate` endpoint and preserves CID continuation when Google returns usable metadata.
 
 Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
 

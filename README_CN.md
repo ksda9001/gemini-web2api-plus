@@ -255,7 +255,7 @@ Agent 相关配置:
 - `continuation_attempts`: Gemini Web 明确返回输出上限标记 (`BardErrorInfo 1155`) 时，自动从断点续写的最大轮数
 - `sse_heartbeat_sec`: 等待 Gemini 首段或 agent 工具决策期间发送 SSE 注释心跳的间隔，避免 NewAPI、Open WebUI 或反向代理把仍在工作的请求当成断连
 - `reuse_upstream_sessions`: 启用 Gemini Web 上游会话复用；保存完整 metadata，适用于普通聊天和 Chat Completions、Claude Messages、Codex Responses、Google 原生 `/v1beta` 的 Agent 工具循环。匿名部署默认保持 `false`；配置同一浏览器会话的 Cookie 后再启用
-- `upstream_session_backend`: `gemini_webapi` 使用动态网页 token/模型 header 和 Cookie 刷新；`direct` 保留旧逆向请求实现
+- `upstream_session_backend`: `gemini_webapi` 使用外部 Gemini 网页会话库，支持动态页面 token、模型 header 和 Cookie 刷新；`direct` 指项目自身直接请求 Gemini Web 内部 `StreamGenerate` 端点的旧实现，不是官方 API，也不是无状态模型接口。两种后端都能携带 Gemini 网页会话 metadata/CID
 - `upstream_session_fallback_direct`: 新后端初始化或续接失败时，自动用完整历史回退到 direct 后端
 - `reuse_upstream_agent_sessions`: 在 SQLite 中保存 Agent `call_id` 到 Gemini Web metadata 的映射。完整 Agent 行为提示和工具定义只在创建网页会话时发送；后续只发送规范化的新增工具事件和用户追问
 - `agent_use_webapi`: 以登录后的 Gemini 网页会话作为 Agent 主后端。工具仍由 Codex、Claude Code 或 Copilot 执行，结果会作为增量外部工具事件续接到同一个 Gemini 对话
@@ -268,6 +268,8 @@ Agent 相关配置:
 - `tool_retry_attempts`: 模型应该调用工具却返回文本时的修复重试次数
 - `temporary_background_tasks`: 识别 Open WebUI 默认的标题、标签、后续问题和图片提示词后台请求，并使用 Gemini 临时聊天发送；这些辅助请求仍会正常返回结果，但不会出现在 Gemini 网页历史中，只有真实对话会保留
 - `require_authenticated_webapi`: 使用持久化上游会话前要求 Gemini 账号状态为 `AVAILABLE`；Cookie 过期时会明确记录并走已配置的 direct 回退，不再静默创建无法出现在账号历史中的匿名会话
+
+Agent 网页续接采用增量方式：首轮只发送一次行为提示、工具定义和任务，并在工具调用后把 Gemini 会话 metadata 按客户端 `call_id` 保存到 SQLite。后续轮恢复同一个 CID，只发送规范化后的新增工具调用/结果事件和新增用户文本。如果外部 `gemini-webapi` 适配器拒绝当前账号会话，兜底仍请求 Gemini Web 的 `StreamGenerate` 端点；只要 Google 返回可用 metadata，就继续复用 CID。
 
 流式接口不会再把空上游响应作为正常的 `STOP` 返回。空响应会按 `retry_attempts` 自动重试；检测到 1155 截断时会自动续写并去除重叠片段。SSE 心跳只是注释帧，不会显示在聊天正文，也不会改变 Codex、Claude Code、Copilot 的工具调用协议。
 
