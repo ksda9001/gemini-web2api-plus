@@ -1,8 +1,4 @@
-# gemini-web2api
-
-<p align="center">
-  <img src="logo.png" width="160" alt="gemini-web2api logo">
-</p>
+# gemini-web2api-plus
 
 <p align="center">
   <strong>把 Gemini 网页端变成 Codex、Claude Code、Copilot 可用的 Agent 后端。</strong><br>
