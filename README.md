@@ -1,100 +1,163 @@
 # gemini-web2api
 
 <p align="center">
-  <img src="logo.png" width="200" alt="gemini-web2api logo">
+  <img src="logo.png" width="160" alt="gemini-web2api logo">
 </p>
 
-[中文文档](README_CN.md)
+<p align="center">
+  <strong>Turn Gemini Web into an Agent backend for Codex, Claude Code, and Copilot.</strong><br>
+  An unofficial compatibility gateway for coding agents, chat UIs, SDKs, and Google-native clients.
+</p>
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
+<p align="center">
+  <a href="https://github.com/ksda9001/gemini-web2api-plus/stargazers"><img src="https://img.shields.io/github/stars/ksda9001/gemini-web2api-plus?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://github.com/ksda9001/gemini-web2api-plus/network/members"><img src="https://img.shields.io/github/forks/ksda9001/gemini-web2api-plus?style=flat-square" alt="GitHub forks"></a>
+  <a href="https://github.com/ksda9001/gemini-web2api-plus/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ksda9001/gemini-web2api-plus?style=flat-square" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10 or newer">
+  <img src="https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker ready">
+</p>
 
-## Features
+<p align="center"><a href="README_CN.md">中文文档</a></p>
 
-- **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
-- **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
-- **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
-- **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
-- **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
-- **Streaming**: SSE streaming support via `httpx`
-- **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
-- **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+> **Important:** This is an unofficial bridge to Gemini's web service, not an official Google API. It uses a browser session or anonymous web access, so upstream behavior, account access, and rate limits remain controlled by Google. Use it only with accounts and traffic you are authorized to use.
 
-## Quick Start
+## Why this project?
+
+Most Gemini web wrappers solve one problem: send text to Gemini. `gemini-web2api-plus` is an **Agent-first Gemini gateway**: one backend can serve Codex CLI, Claude Code, Copilot-style agents, chat UIs, OpenAI SDKs, and Google-native clients at the same time.
+
+- **Drop-in API gateway** for OpenAI-compatible applications.
+- **Agent-first compatibility** for Codex CLI, Claude Code, and Copilot-style clients, including real multi-step tool loops.
+- **Streaming that survives long work**, with SSE heartbeats, retries, and automatic continuation for Gemini output-limit errors.
+- **Conversation continuity**, using Gemini Web conversation metadata plus SQLite mappings for client histories and tool loops.
+- **Optional authenticated Web sessions**, cookie refresh, proxies, API keys, and Docker persistence.
+- **One small Python service**, with no database server or frontend required.
+
+## Compatibility at a glance
+
+| Client or integration | Endpoint | Supported behavior |
+| --- | --- | --- |
+| OpenWebUI, NewAPI, Cherry Studio, ChatBox | `/v1/chat/completions` | Chat, SSE streaming, function calling |
+| Codex CLI | `/v1/responses` | Responses API, tool calls, `previous_response_id`, multi-step loops |
+| Claude Code | `/v1/messages` | Anthropic Messages, streaming tool use, thinking blocks |
+| Copilot-style agents | `/v1/chat/completions` | OpenAI-compatible tool loops |
+| Gemini CLI and Google-native clients | `/v1beta/models/...` | `generateContent`, `streamGenerateContent`, function calls |
+| OpenAI Python SDK | `/v1` | Chat Completions and streaming |
+
+The server is the model gateway. It emits tool calls; the connected agent client executes those tools in its own real environment. The gateway never pretends that Gemini itself can access the client's filesystem or terminal.
+
+## How the request flows
+
+```mermaid
+flowchart LR
+    A[OpenAI clients] --> R[Compatibility router]
+    B[Claude Code] --> R
+    C[Codex / Copilot] --> R
+    D[Gemini-native clients] --> R
+    R --> W[Gemini Web session]
+    R <--> S[(SQLite state)]
+    R --> T[Tool-call protocol]
+    T <--> E[External agent runtime]
+```
+
+For a normal chat, the router sends a compact prompt to Gemini Web. For an agent request, it sends the task and declared tools, returns a protocol-native tool call, receives the external tool result, and continues the same Gemini Web conversation. SQLite stores the bridge between the client-visible history and Gemini's conversation metadata.
+
+## Quick start
+
+### Docker (recommended)
 
 ```bash
-pip install httpx
-python -m gemini_web2api
+git clone https://github.com/ksda9001/gemini-web2api-plus.git
+cd gemini-web2api-plus
+
+cp config.example.json config.json
+docker build -t gemini-web2api .
+
+docker run -d \
+  --name gemini-web2api \
+  --restart unless-stopped \
+  -p 8081:8081 \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  -v gemini-web2api-data:/app/data \
+  gemini-web2api
 ```
 
-Server starts at `http://localhost:8081/v1`.
-
-## Client Configuration
-
-### Cherry Studio / ChatBox / any OpenAI client
-
-| Field | Value |
-|-------|-------|
-| Base URL | `http://localhost:8081/v1` |
-| API Key | any `api_keys` value from `config.json`; anything if not configured |
-| Model | `gemini-3.5-flash-thinking` |
-
-### curl
-
-#### bash / macOS / Linux
+Check that the service is alive:
 
 ```bash
-curl http://localhost:8081/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
+curl http://127.0.0.1:8081/
 ```
 
-#### PowerShell (Windows)
+The persistent `/app/data` volume keeps SQLite state and derived cookie cache across container recreation. Do not put cookies or real API keys into the image.
 
-```powershell
-curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+### Python
+
+```bash
+git clone https://github.com/ksda9001/gemini-web2api-plus.git
+cd gemini-web2api-plus
+
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+cp config.example.json config.json
+python -m gemini_web2api --config config.json
 ```
 
-> Note: On Windows PowerShell, use `curl.exe` and `--%` so PowerShell does not reinterpret JSON quoting or curl options.
+The default listener is `http://127.0.0.1:8081`. Use `--port`, `--proxy`, or `--cookie-file` for one-off overrides:
 
-### OpenAI Python SDK
+```bash
+python -m gemini_web2api --config config.json --port 8081
+python -m gemini_web2api --cookie-file ./cookie.json
+python -m gemini_web2api --proxy http://127.0.0.1:7890
+```
+
+## First API call
+
+With `api_keys: []`, authentication is disabled. If you configure one or more keys, `/v1/*` requests require a Bearer token or `x-api-key`.
+
+```bash
+curl http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-key' \
+  -d '{
+    "model": "gemini-3.5-flash",
+    "messages": [{"role": "user", "content": "Hello from gemini-web2api"}]
+  }'
+```
+
+OpenAI Python SDK:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
-    messages=[{"role": "user", "content": "Explain quantum computing"}]
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8081/v1",
+    api_key="sk-your-key",
 )
-print(resp.choices[0].message.content)
+
+answer = client.chat.completions.create(
+    model="gemini-3.5-flash-thinking",
+    messages=[{"role": "user", "content": "Explain quantum computing simply."}],
+)
+print(answer.choices[0].message.content)
 ```
 
-### Gemini CLI
+## Agent setup
 
-```bash
-export GEMINI_API_KEY=none
-export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
-gemini
-```
+Agent clients use different wire protocols. Point each client at the matching base URL and let the client keep driving the tool loop.
 
-Supports Google native API endpoints:
-- `GET /v1beta/models` — list models
-- `POST /v1beta/models/{model}:generateContent` — non-streaming
-- `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
+| Client | Base URL | Wire protocol |
+| --- | --- | --- |
+| Codex CLI | `http://127.0.0.1:8081/v1` | OpenAI Responses API |
+| Claude Code | `http://127.0.0.1:8081` | Anthropic Messages API |
+| Copilot or another OpenAI-compatible agent | `http://127.0.0.1:8081/v1` | Chat Completions |
 
-### Agent Clients
+### Codex CLI
 
-Codex CLI, Claude Code, and Copilot-style coding agents require streaming tool-use protocols, not just plain chat completions. This server exposes the compatible endpoints below:
-
-| Client | Base URL | API surface |
-|--------|----------|-------------|
-| Codex CLI | `http://localhost:8081/v1` | OpenAI Responses API (`/v1/responses`) |
-| Claude Code | `http://localhost:8081` | Anthropic Messages API (`/v1/messages`) |
-| Copilot / OpenAI-compatible agents | `http://localhost:8081/v1` | Chat Completions (`/v1/chat/completions`) |
-
-Example Codex provider:
+Example provider configuration:
 
 ```toml
 model_provider = "gemini-web2api"
@@ -102,303 +165,256 @@ model = "gemini-3.5-flash"
 
 [model_providers.gemini-web2api]
 name = "gemini-web2api"
-base_url = "http://localhost:8081/v1"
+base_url = "http://127.0.0.1:8081/v1"
 wire_api = "responses"
 env_key = "GEMINI_WEB2API_KEY"
 requires_openai_auth = false
 ```
 
-Example Claude Code environment:
+Set `GEMINI_WEB2API_KEY` to a value from `api_keys`, or use any placeholder when authentication is disabled.
+
+### Claude Code
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8081
 export ANTHROPIC_AUTH_TOKEN=sk-your-key
 export ANTHROPIC_MODEL=gemini-3.5-flash
 ```
 
-Agent compatibility includes:
-- automatic tool-call repair retry when the model describes an action instead of calling a tool
-- rejection and repair of model-invented tool names that were not declared by the client
-- SQLite-backed Responses history for `previous_response_id` and `GET /v1/responses/{id}`
-- complete 10-field Gemini Web conversation metadata persisted for plain chat and agent requests
-- the full Agent behavior instruction only on the first tool turn, plus compact JSON tool schemas on stateless follow-up turns
-- deterministic truncation/compaction of long tool outputs and old history
-- Anthropic `thinking` / `redacted_thinking` preservation in prompt context
-- tested multi-step loops for Codex Responses, Claude Messages, and Copilot/OpenAI Chat Completions
+If Claude Code is routed through NewAPI, NewAPI may convert the request into Google-native `streamGenerateContent`. The gateway recognizes Claude, Codex, and Copilot agent markers in that converted system prompt and preserves the tool protocol for the round trip.
 
-### Chat vs Agent Tool Use
+### Copilot-style clients
 
-Google native streaming requests (`/v1beta/models/{model}:streamGenerateContent`) default `google_stream_auto_tools` to `false`. Many chat UIs, including Open WebUI/NewAPI-style integrations, may send `tools` plus `functionCallingConfig.mode=AUTO` even for ordinary chat. Injecting those tool schemas into the Gemini Web prompt can make the prompt very large and cause empty or truncated replies, so the default treats that specific stream AUTO case as plain streaming chat.
+Choose an OpenAI-compatible provider and use:
 
-Tool-free OpenAI, Responses, and Anthropic requests do not receive the Agent behavior instruction. Codex uses `/v1/responses`, Claude Code uses `/v1/messages`, and Copilot/OpenAI-compatible agents use `/v1/chat/completions`; requests that actually provide tools keep complete agent behavior. On an agent request, the full Agent behavior instruction is injected only before the first tool call. Follow-up requests whose history already contains a tool call/result omit that instruction.
-
-Clients normally include `tools` in every HTTP request as part of Codex, Claude, and Copilot model protocols. With `reuse_upstream_sessions` enabled, the server uses `gemini-webapi` for live page tokens, dynamic model headers, cookie rotation, and complete conversation metadata. SQLite restores sessions by message-history prefix or tool call ID, so follow-up turns send only new messages/tool results. This applies to OpenAI Chat Completions, Codex Responses, Claude Messages, and Google-native `/v1beta` plain chats used by Open WebUI. If authentication or metadata continuation fails, the request automatically falls back to compressed full-history replay through the legacy direct backend. The connected agent client still executes each tool and drives the loop until the model returns a final answer.
-
-## Available Models
-
-| Model | Description | Output |
-|-------|-------------|--------|
-| `gemini-3.5-flash` | Fast general-purpose | ~12k chars |
-| `gemini-3.5-flash-thinking` | Deep thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Pro (needs cookie for real routing) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Lightweight fast | ~10k chars |
-
-### Thinking Depth
-
-Append `@think=N` to any model name:
-
+```text
+Base URL: http://127.0.0.1:8081/v1
+Model:    gemini-3.5-flash
+API key:  a configured api_keys value, or a placeholder when auth is disabled
 ```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
+
+The exact environment variables depend on the client or extension.
+
+### What makes the agent loop persistent?
+
+Agent behavior is deliberately split between the gateway and the external client:
+
+1. The first tool turn sends the task, behavior instructions, and declared tools.
+2. Gemini returns a native tool call through the client's protocol.
+3. Codex, Claude Code, or Copilot executes the tool and sends back the result.
+4. SQLite maps the tool call or message history to Gemini Web conversation metadata.
+5. Later turns send only new user text and trusted tool results when the saved session can be resumed.
+
+This avoids injecting a large Agent prompt into every turn. If a Web session expires or cannot be resumed, the gateway rebuilds a compact history and can fall back to the legacy direct Gemini Web transport.
+
+## Models
+
+| Model name | Use case | Notes |
+| --- | --- | --- |
+| `gemini-3.5-flash` | Fast everyday chat | General-purpose default |
+| `gemini-3.5-flash-thinking` | Reasoning and long tasks | Longest thinking output |
+| `gemini-3.5-flash-thinking-lite` | Adaptive reasoning | Lower-latency thinking mode |
+| `gemini-3.1-pro` | Pro routing | Real Pro routing requires an eligible account cookie |
+| `gemini-3.1-pro-enhanced` | Experimental Pro mode | Additional upstream fields |
+| `gemini-auto` | Automatic selection | Lets the upstream choose |
+| `gemini-flash-lite` | Lightweight requests | Lower-cost, faster mode |
+
+Override thinking depth by appending `@think=N`:
+
+```text
+gemini-3.5-flash-thinking@think=0   # deepest
 gemini-3.5-flash-thinking@think=2   # medium
 gemini-3.5-flash-thinking@think=4   # shallowest
 ```
 
-## Optional: Cookie for Pro
+Unknown model identifiers fall back to the configured default model so clients that send their own model alias can still connect.
 
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
+## Gemini Web sessions and cookies
 
-```bash
-python -m gemini_web2api --cookie-file cookie.txt
-```
+Anonymous access is useful for trying the service. Persistent Gemini history, real Pro routing, and reliable Agent continuation require an authenticated browser session.
 
-### How to get cookies
+The server accepts:
 
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
-2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy `__Secure-1PSID` and `__Secure-1PSIDTS` from the same browser session; a full export may also retain `SID`, `HSID`, `SSID`, `APISID`, and `SAPISID`
-4. Create `cookie.txt` in this format:
+- `name=value` cookie strings
+- compact JSON cookie payloads
+- Chrome or Playwright cookie-object arrays
+- `{"url":"https://gemini.google.com", "cookies":[...]}` exports
 
-```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value; __Secure-1PSIDTS=your_1psidts_value
-```
+For a browser export, keep at least `__Secure-1PSID` and `__Secure-1PSIDTS` from the same signed-in session. Companion cookies such as `SID`, `HSID`, `SSID`, `APISID`, and `SAPISID` may also be useful. Cookie exports contain credentials: keep them outside Git, mount them read-only, and rotate them when the Google session expires.
 
-Or use the compact JSON format:
-```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx; __Secure-1PSIDTS=xxx", "sapisid": "your_sapisid_value"}
-```
-
-Complete Chrome/Playwright-style JSON exports are also accepted directly, either as a cookie-object array or as `{"url":"https://gemini.google.com","cookies":[...]}`. This is the preferred format because it retains each cookie's domain and expiration time. Expired short-lived cookies such as `__Secure-1PSIDRTS` are then omitted automatically, matching browser behavior. When the mounted Cookie file is replaced, stale derived refresh-cache files are cleared without deleting SQLite conversations.
-
-**Alternative (browser extension)**: Use an "Export Cookies" extension that preserves cookie objects and expiration dates. Keep the export private and mount it as `cookie_file`; never commit it to Git.
-
-### Authenticated account path and XSRF token
-
-If the signed-in Gemini page URL contains an account index, such as:
-
-```
-https://gemini.google.com/u/1/app/...
-```
-
-set `auth_user` to that index. Authenticated web requests may also require the page XSRF token. In the rendered Gemini page source, this token is exposed as `SNlM0e`; pass it as `xsrf_token` in `config.json`. The server sends it as the `at` form field.
-
-Example:
+Minimal authenticated configuration:
 
 ```json
 {
-  "cookie_file": "/app/cookie.txt",
-  "auth_user": "1",
-  "xsrf_token": "AOOh0P...",
-  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
-}
-```
-
-If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
-
-Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
-
-## Configuration
-
-Create `config.json` in the same directory:
-
-```json
-{
-  "port": 8081,
-  "host": "0.0.0.0",
-  "retry_attempts": 3,
-  "retry_delay_sec": 2,
-  "request_timeout_sec": 180,
-  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
-  "auth_user": null,
-  "xsrf_token": null,
-  "api_keys": ["sk-your-key"],
-  "cookie_file": null,
-  "proxy": null,
-  "log_requests": true,
-  "response_store_path": "responses.db",
-  "response_store_ttl_sec": 86400,
-  "response_store_max_rows": 1000,
-  "max_tool_output_chars": 12000,
-  "max_history_messages": 40,
-  "max_history_chars": 60000,
-  "max_google_prompt_chars": 18000,
-  "max_google_agent_prompt_chars": 40000,
-  "google_stream_auto_tools": false,
-  "google_stream_auto_agent_tools": true,
-  "continuation_attempts": 2,
-  "sse_heartbeat_sec": 10,
-  "reuse_upstream_sessions": false,
-  "upstream_session_backend": "gemini_webapi",
-  "upstream_session_fallback_direct": true,
+  "api_keys": ["replace-this-key"],
+  "cookie_file": "/app/cookie.json",
+  "response_store_path": "/app/data/responses.db",
+  "reuse_upstream_sessions": true,
   "reuse_upstream_agent_sessions": true,
-  "agent_use_webapi": true,
-  "agent_webapi_rebuild_on_failure": true,
-  "agent_request_timeout_sec": 75,
-  "agent_retry_attempts": 1,
-  "cookie_cache_path": "/app/data/gemini_cookies",
-  "cookie_auto_refresh": true,
-  "cookie_refresh_interval_sec": 600,
-  "webapi_watchdog_sec": 120,
-  "webapi_request_timeout_sec": 180,
-  "tool_retry_attempts": 1,
-  "temporary_background_tasks": true,
-  "require_authenticated_webapi": true,
-  "webapi_allow_unverified_account": false
+  "agent_use_webapi": true
 }
 ```
 
-When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+If the Gemini URL contains an account index such as `/u/1/`, set `auth_user` to `"1"`. Some authenticated sessions also need the page XSRF value exposed as `SNlM0e`; set it as `xsrf_token`. Never paste a real token into a public issue, README, image, or commit.
 
-Agent-related config:
-- `response_store_path`: SQLite file for Responses API state; mount it as a volume in Docker if you want history to survive container recreation
-- `response_store_ttl_sec`: history retention window
-- `max_tool_output_chars`: head/tail truncation limit for shell/tool outputs stored in context
-- `max_history_messages` / `max_history_chars`: deterministic context compaction limits
-- `max_google_prompt_chars`: hard cap for Google native prompt text sent upstream; older context is trimmed first to reduce empty/truncated responses
-- `max_google_agent_prompt_chars`: separate cap for Google requests carrying an Agent tool schema; it defaults to `40000` because Claude/Codex/Copilot system prompts are larger than ordinary chat prompts
-- `google_stream_auto_tools`: keep `false` to prioritize stable Open WebUI/NewAPI-style streaming chat; set `true` only to enable Google native streaming AUTO function calling for otherwise unmarked requests
-- `google_stream_auto_agent_tools`: when `true`, automatically preserves tools for Google-native requests converted from Claude Code, Codex, or Copilot. The request is recognized from its Agent system markers, while ordinary Open WebUI/NewAPI chat remains text-only under the previous setting
-- `continuation_attempts`: maximum automatic continuation turns when Gemini Web reports its output-limit marker (`BardErrorInfo 1155`)
-- `sse_heartbeat_sec`: SSE comment heartbeat interval while waiting for Gemini's first output or an agent tool decision, keeping NewAPI, Open WebUI, and reverse proxies from treating active work as a dead connection
-- `reuse_upstream_sessions`: enable Gemini Web continuation with complete metadata for plain chats and Agent tool loops across Chat Completions, Claude Messages, Codex Responses, and Google-native `/v1beta`. It defaults to `false` for anonymous deployments; enable it after mounting cookies from one browser session
-- `upstream_session_backend`: `gemini_webapi` uses the external Gemini Web session library with dynamic page tokens/model headers and cookie refresh; `direct` means this project's legacy direct request to Gemini Web's internal `StreamGenerate` endpoint, not an official or stateless model API. Both backends can carry Gemini Web conversation metadata/CIDs
-- `upstream_session_fallback_direct`: replay full history through the direct backend if the primary backend cannot initialize or resume
-- `reuse_upstream_agent_sessions`: persist the Agent call ID to Gemini Web metadata mapping in SQLite. The full Agent behavior prompt and tool schema are sent when the Web conversation is created; later turns send only normalized new tool events and user follow-ups
-- `agent_use_webapi`: use the authenticated Gemini Web conversation as the primary Agent backend. Tool calls still execute in Codex, Claude Code, or Copilot; their results are encoded as incremental external-tool events in the same Gemini conversation
-- `agent_webapi_rebuild_on_failure`: if a saved Gemini CID cannot resume, replay the compacted full Agent history into one fresh Gemini Web conversation and replace the SQLite mapping before falling back to the direct backend
-- `agent_request_timeout_sec` / `agent_retry_attempts`: limits used only by Agent turns for both Web and direct requests. The defaults (`75` seconds, `1` attempt) avoid spending several minutes on a stalled request before recovery; ordinary chat retains its own timeout and retry settings
-- `cookie_cache_path`: private persistent directory for rotated Google cookies; mount it as a volume and never commit it. Replacing the mounted source Cookie automatically clears stale derived cache while preserving SQLite conversation memory
-- `cookie_auto_refresh` / `cookie_refresh_interval_sec`: rotate and persist `__Secure-1PSIDTS` in the background
-- `webapi_watchdog_sec`: no-progress timeout for a stalled Gemini Web stream
-- `webapi_request_timeout_sec`: total wait for non-stream requests and idle wait between streaming deltas; expiration cancels the background task and allows the configured direct fallback
-- `tool_retry_attempts`: repair retries when the model should call a tool but returns text
-- `temporary_background_tasks`: recognize Open WebUI's default title, tags, follow-up, and image-prompt helper requests and send them as Gemini temporary chats, so only the real conversation appears in Gemini Web history
-- `require_authenticated_webapi`: require Gemini account status `AVAILABLE` before using persistent upstream sessions; expired cookies are reported and routed through the configured direct fallback instead of silently creating anonymous conversations
-- `webapi_allow_unverified_account`: keep `false` by default. Set it to `true` only after a real Gemini Web probe with the mounted Cookie can create a visible conversation and receive a response, but the external `gemini-webapi` library still misreports `UNAUTHENTICATED`; it permits that known library-status false positive without disabling Cookie checks
+The Web backend can refresh short-lived cookie state when enabled. A refresh cache is stored under `cookie_cache_path`; mount `/app/data` persistently if you want it to survive restarts.
 
-Agent Web continuation is incremental: the initial turn sends the behavior instruction, tool schema, and task once. Gemini is told that it is the decision layer of an external runtime: it requests functions, while Codex, Claude Code, or Copilot executes them. A successful tool call saves its Gemini conversation metadata under the client call ID in SQLite. Later turns resume that CID with only a compact trusted tool-call/result receipt and any new user text; the receipt explicitly identifies completed execution data rather than a user prompt, so Gemini continues the task instead of treating the result as a simulated terminal transcript. A lone `.` supplied alongside a tool event is treated as a client placeholder and is not sent to Gemini. If the external `gemini-webapi` adapter rejects the account session, the fallback still targets Gemini Web's `StreamGenerate` endpoint and preserves CID continuation when Google returns usable metadata.
+## Configuration that matters
 
-When NewAPI converts Claude Messages, Codex Responses, or Copilot Chat Completions into Google `streamGenerateContent`, the same Agent path is selected from the converted system prompt. Google `functionCall` parts are converted back to the client's tool protocol, and the stable generated call ID is used to find the matching Gemini CID in SQLite on the next tool-result request. Claude title/metadata requests remain temporary tool-free requests even when their system prompt contains an Agent marker.
+Start from [`config.example.json`](config.example.json). The complete file is intentionally documented there; these are the settings most people need:
 
-Streaming endpoints no longer report an empty upstream response as a successful `STOP`. Empty responses are retried according to `retry_attempts`; an explicit 1155 truncation is continued automatically with overlapping text removed. SSE heartbeats are comment frames, so they do not appear in chat content or alter the Codex, Claude Code, or Copilot tool protocols.
+| Setting | Purpose | Typical choice |
+| --- | --- | --- |
+| `api_keys` | Protect `/v1/*` | Set a strong private key for any network deployment |
+| `cookie_file` | Authenticated Gemini Web session | `/app/cookie.json` or `null` |
+| `response_store_path` | SQLite history and Agent mappings | `/app/data/responses.db` in Docker |
+| `reuse_upstream_sessions` | Reuse Gemini Web conversations | `true` with a valid cookie |
+| `reuse_upstream_agent_sessions` | Map Agent tool calls to Gemini CIDs | `true` for Agent clients |
+| `agent_use_webapi` | Use the authenticated Web session backend | `true` for persistent history |
+| `google_stream_auto_tools` | Allow tools in unmarked Google streams | Usually `false` for ordinary chat |
+| `google_stream_auto_agent_tools` | Preserve tools in Claude/Codex/Copilot requests converted to Google | `true` |
+| `sse_heartbeat_sec` | Keep long requests alive through proxies | `10` |
+| `proxy` | HTTP proxy for Google access | Set when direct access is unavailable |
 
-## Docker
+For a public or LAN deployment, configure an API key, bind behind HTTPS or a private network, mount the data directory, and never expose cookie files.
+
+## Docker Compose
+
+The repository includes a minimal `docker-compose.local.yml`. For a persistent deployment, use a data volume and a private config file:
+
+```yaml
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./cookie.json:/app/cookie.json:ro
+      - gemini-web2api-data:/app/data
+
+volumes:
+  gemini-web2api-data:
+```
+
+Set `cookie_file` to `/app/cookie.json` only when using an authenticated session. Without a persistent `/app/data` volume, SQLite history and the derived cookie cache disappear when the container is removed.
+
+## Google-native API
+
+Gemini CLI-style clients can use the Google-shaped endpoints directly:
 
 ```bash
-cp config.example.json config.json
-docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 \
-  -v ./config.json:/app/config.json \
-  -v gemini-web2api-data:/app/data \
-  gemini-web2api
+export GEMINI_API_KEY=placeholder
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8081
+gemini
 ```
 
-Use the equivalent named volume with Podman. Without a persistent `/app/data` mount, SQLite history can be lost when the container is removed and recreated.
+Available routes:
 
-Or use Docker Compose:
-
-```bash
-cp config.example.json config.json
-docker compose up -d
+```text
+GET  /v1beta/models
+POST /v1beta/models/{model}:generateContent
+POST /v1beta/models/{model}:streamGenerateContent
 ```
 
-To mount a cookie file:
+Google-native streaming requests with `functionCallingConfig.mode=AUTO` are treated as ordinary text chat by default. This protects OpenWebUI/NewAPI from accidentally sending a large tool schema on every normal message. Requests converted from Claude Code, Codex, or Copilot are recognized separately when `google_stream_auto_agent_tools` is enabled.
 
-```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
-```
+## Tool calling
 
-Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
-
-> **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
-
-## Proxy
-
-If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
-
-**Method 1: CLI argument**
-```bash
-python -m gemini_web2api --proxy http://127.0.0.1:7890
-```
-
-**Method 2: config.json**
-```json
-{"proxy": "http://127.0.0.1:7890"}
-```
-
-**Method 3: Environment variable** (auto-detected)
-```bash
-export HTTPS_PROXY=http://127.0.0.1:7890
-python -m gemini_web2api
-```
-
-Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
-
-## Tool Calling
+OpenAI-compatible function calling works through Chat Completions, Responses, Anthropic Messages, and the Google-native compatibility route:
 
 ```python
-resp = client.chat.completions.create(
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="sk-your-key")
+
+response = client.chat.completions.create(
     model="gemini-3.5-flash",
-    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    messages=[{"role": "user", "content": "Check the current project directory."}],
     tools=[{
         "type": "function",
         "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            "name": "shell_command",
+            "description": "Run a command in the connected agent environment",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
         }
     }]
 )
+
+print(response.choices[0].message.tool_calls)
 ```
+
+The tool is declared and executed by the client application. Do not grant an agent more filesystem or network access than you intend to grant the client itself.
+
+## Reliability behavior
+
+Gemini Web is not an official public API, so the gateway focuses on making failure modes recoverable:
+
+- SSE comment heartbeats prevent NewAPI, OpenWebUI, and reverse proxies from declaring an active request dead.
+- Empty upstream responses are retried instead of being returned as a successful empty `STOP`.
+- `BardErrorInfo 1155` output-limit responses can trigger automatic continuation.
+- Long tool outputs and old histories are compacted deterministically.
+- A failed authenticated Web session can rebuild from compact history and fall back to the older direct transport.
+- Cookie expiration metadata is respected, including short-lived `__Secure-1PSIDRTS` entries.
+
+These mechanisms improve recovery; they cannot make Google's unofficial Web protocol stable forever.
+
+## Troubleshooting
+
+### The service starts but replies are empty or truncated
+
+1. Check `curl http://127.0.0.1:8081/` and the container logs.
+2. Confirm the host can reach `gemini.google.com`.
+3. Configure `proxy` or `HTTPS_PROXY` when direct access is blocked.
+4. With Docker, try host networking if the upstream rejects the bridge/NAT address.
+5. For authenticated sessions, replace expired cookies and keep `/app/data` mounted.
+
+### An agent prints code and asks me to copy it
+
+Confirm that the client is using its tool-capable endpoint: `/v1/responses` for Codex, `/v1/messages` for Claude Code, or `/v1/chat/completions` for Copilot-style clients. The request must actually include declared tools. If NewAPI converts the request to Google-native format, keep `google_stream_auto_agent_tools` enabled.
+
+### Agent history does not continue
+
+Set `reuse_upstream_sessions`, `reuse_upstream_agent_sessions`, and `agent_use_webapi` to `true`, use a valid browser session, and persist `/app/data`. SQLite stores the bridge state; it does not replace the conversation history managed by the calling client.
+
+### Authentication fails
+
+Make sure the cookie values came from one browser session, the account index matches `/u/<index>/`, and the cookie file is mounted at the same path used by `cookie_file`. Never put a cookie or XSRF token in Git.
 
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
-- **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Unofficial upstream protocol**: Google web protocol, model-header, or risk-control changes can still break continuation. Full-history replay is a fallback, not an official API stability guarantee.
-- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+- This project relies on an unofficial Gemini Web protocol and can break when Google changes its frontend or risk controls.
+- Google account cookies are sensitive credentials and may expire or be revoked. This project cannot prevent Google from invalidating them.
+- Real Pro routing requires an eligible Gemini Advanced account; a cookie alone does not upgrade a free account.
+- Gemini, account, network, and reverse-proxy rate limits still apply.
+- Agent tools run in the external client environment, not inside this API container.
+- Image input is supported through the authenticated upload path, but multimodal behavior depends on the upstream Web session and can be less reliable than text.
+- This is a compatibility gateway, not a replacement for an official Google API or a guarantee of unrestricted access.
 
-## Requirements
+## Development
 
-- Python 3.10+
-- `gemini-webapi` for dynamic authentication, model discovery, cookie rotation, and chat metadata
-- `httpx` for streaming on the legacy direct fallback
-- Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
+```bash
+python -m unittest discover -s tests -q
+python3 -m py_compile gemini_web2api/*.py tests/test_agent_compat.py
+git diff --check
+```
 
-## How It Works
-
-This tool converts OpenAI, Anthropic, and Gemini requests into Gemini Web conversations. Its primary session backend reuses `HanaokaYuzu/Gemini-API` for dynamic page tokens, model discovery, cookie rotation, and `ChatSession.metadata`; SQLite links that metadata to client-visible history. The older `[79]` mode payload remains only as a direct fallback.
-
-The adapter gives every API conversation its own metadata list and explicitly restores the intended CID. This also works around the shared `DEFAULT_METADATA` list in the published `gemini-webapi 2.0.0` wheel, preventing unrelated API conversations from being appended to one Gemini Web history item.
+The test suite covers OpenAI Chat Completions, Responses, Anthropic Messages, Google-native requests, streaming, tool-call repair, SQLite persistence, cookie parsing, and Web-session fallback behavior.
 
 ## Acknowledgments
 
-- Inspired by the open-source API proxy ecosystem
 - [HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) for the dynamic Gemini Web session client
-- [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI) for persistent history-prefix session matching design
+- [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI) for ideas around persistent session matching
+- The open-source Gemini Web compatibility ecosystem
 
 ## License
 
-MIT
+[MIT](LICENSE)
 
----
-
-## 致谢
-
-本项目的开发 agent 能力由 [GenericAgent](https://github.com/lsdefine/GenericAgent) 提供。
-
-### 🚩 友情链接
-
-[![GenericAgent](https://img.shields.io/badge/Agent_Framework-GenericAgent-orange?style=for-the-badge&logo=github)](https://github.com/lsdefine/GenericAgent)
-[![LinuxDo](https://img.shields.io/badge/社区-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
+If this project saves you time, a star helps other developers find it. Bug reports with reproducible requests, sanitized logs, and environment details are especially useful.
