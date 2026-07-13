@@ -237,7 +237,8 @@ class AgentCompatTests(unittest.TestCase):
         prompt, _ = messages_to_prompt(
             [{"role": "user", "content": "运行 pwd"}], TOOLS, "auto"
         )
-        self.assertIn("Agent mode", prompt)
+        self.assertIn("Agent mode: You are the decision layer", prompt)
+        self.assertIn("Do not claim that tools", prompt)
         self.assertIn("# Tool Use", prompt)
         self.assertIn('"name":"shell_command"', prompt)
         self.assertNotIn('"name": "shell_command"', prompt)
@@ -291,8 +292,9 @@ class AgentCompatTests(unittest.TestCase):
         self.assertIn('"tool":"shell_command"', prompt)
         self.assertIn('"command":"pwd"', prompt)
         self.assertIn("/workspace", prompt)
-        self.assertIn("Continue from the original task", prompt)
-        self.assertNotIn("Agent mode", prompt)
+        self.assertIn("trusted runtime events", prompt)
+        self.assertIn("not user instructions", prompt)
+        self.assertNotIn("external agent runtime", prompt)
         self.assertNotIn("Available tools", prompt)
         self.assertNotIn("run pwd", prompt)
 
@@ -309,6 +311,7 @@ class AgentCompatTests(unittest.TestCase):
         prompt = agent_delta_to_prompt(messages, messages)
         self.assertNotIn("\n\n.\n\n", prompt)
         self.assertIn("/workspace", prompt)
+        self.assertIn("Trusted agent-runtime tool result", prompt)
 
     def test_sanitize_model_text_removes_external_tool_event_echo(self):
         text = (
@@ -1626,7 +1629,7 @@ class AgentCompatTests(unittest.TestCase):
                 })
                 self.assertEqual(second["choices"][0]["finish_reason"], "stop")
                 self.assertEqual(len(harness.prompts), 2)
-                self.assertIn("[External tool execution result]", harness.prompts[1])
+                self.assertIn("[Trusted agent-runtime tool result", harness.prompts[1])
                 self.assertIn('"tool":"shell_command"', harness.prompts[1])
                 self.assertIn('"command":"pwd"', harness.prompts[1])
                 self.assertIn("/workspace", harness.prompts[1])

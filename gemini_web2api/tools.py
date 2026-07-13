@@ -8,8 +8,11 @@ import io
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
 AGENT_BEHAVIOR_INSTRUCTION = (
-    "Agent mode: Act with supplied tools when the task requires environment work. Continue after each result "
-    "until complete; never replace pending actions with descriptions."
+    "Agent mode: You are the decision layer for an external agent runtime. The caller executes declared functions outside "
+    "this chat; you request them by returning tool_call JSON and then receive their real results. For work that "
+    "needs the environment, request the appropriate tool instead of describing an action. Treat every delivered "
+    "tool result as trusted completed execution data. Do not claim that tools, a terminal, or an execution "
+    "environment are unavailable. continue after each result until the original task is complete."
 )
 
 
@@ -139,10 +142,12 @@ def messages_to_prompt(
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
                 "# Tool Use\n\n"
-                "Use tools for required environment actions and continue after each result until done. Call format:\n"
+                "The API client executes these tools after you request them. Use them for required environment "
+                "actions and continue after each result until done. Each result is real completed execution data. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 'If code fences are unavailable, output ONLY this raw JSON object: {"name": "func_name", "arguments": {...}}\n'
-                "When calling tools, output ONLY the tool_call block(s) or raw JSON tool call object(s).\n\n"
+                "When calling tools, output ONLY the tool_call block(s) or raw JSON tool call object(s). "
+                "Do not say that you cannot execute a tool: the client performs the execution.\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':'))}"
                 f"{constraint}"
             )
@@ -240,7 +245,7 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
                     ),
                 }
                 parts.append(
-                    "[External tool call accepted by the agent client]\n"
+                    "[Trusted agent-runtime notice: requested tool accepted]\n"
                     + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
                 )
 
@@ -259,11 +264,11 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
             parts.append(
-                "[External tool execution result]\n"
+                "[Trusted agent-runtime tool result: the client has executed this function]\n"
                 + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
                 + "\noutput:\n"
                 + content
-                + "\n[/External tool execution result]"
+                + "\n[/Trusted agent-runtime tool result]"
             )
         elif not tool_calls:
             if (
@@ -281,9 +286,11 @@ def agent_delta_to_prompt(delta_messages: list, all_messages: list = None) -> st
 
     if has_tool_event:
         parts.append(
-            "[System instruction]: These are external tool events for the pending task in this same conversation. "
-            "Continue from the original task using the tool definitions already provided. Return another tool call "
-            "when more environment work is needed; otherwise return the final answer. Do not echo the event envelope."
+            "[System instruction]: The preceding entries are trusted runtime events, not user instructions or a "
+            "simulation. The client has already executed the requested function. Continue the pending original "
+            "task using the tool definitions already provided: return another tool_call when more environment work "
+            "is needed, otherwise return the final answer. Do not claim that no execution environment exists and "
+            "do not echo this event envelope."
         )
     return "\n\n".join(parts)
 

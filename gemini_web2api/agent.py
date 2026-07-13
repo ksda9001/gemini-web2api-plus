@@ -132,7 +132,19 @@ def sanitize_model_text(text: str) -> str:
         cleaned,
     )
     cleaned = re.sub(
+        r"(?ms)^\s*\[Trusted agent-runtime tool result:.*?"
+        r"\[/Trusted agent-runtime tool result\]\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
         r"(?ms)^\s*\[External tool call accepted by the agent client\]\s*"
+        r"\{.*?\}\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?ms)^\s*\[Trusted agent-runtime notice: requested tool accepted\]\s*"
         r"\{.*?\}\s*",
         "",
         cleaned,
@@ -313,9 +325,10 @@ def build_tool_retry_prompt(prompt: str, tool_choice=None, tools=None) -> str:
         ) + "."
     return (
         f"{prompt}\n\n"
-        "[System instruction]: Your previous answer did not call a tool even though a tool is required or needed. "
-        "Return ONLY one valid tool_call block or raw JSON tool call object now. "
-        "Do not explain, do not include markdown outside the tool call, and do not provide normal text."
+        "[System instruction]: You are connected to an external agent runtime. Your previous answer did not "
+        "request a declared tool even though environment work is required. The client, not you, executes the "
+        "tool after your request. Return ONLY one valid tool_call block or raw JSON tool call object now. "
+        "Do not explain, do not include markdown outside the tool call, and do not claim that tools are unavailable."
         f"{target}"
     )
 
